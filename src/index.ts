@@ -19,6 +19,7 @@ import { RiskEngine } from "./trading/risk-engine.js";
 import { startResetSweeper } from "./trading/reset-sweeper.js";
 import { startMarkPublisher, stopMarkPublisher } from "./realtime/mark-publisher.js";
 
+
 function buildProvider(): MarketDataProvider {
   // Model B — "byo": per-user (bring-your-own) Databento accounts. Chart data
   // (history + polled quote) is served per-request from each user's OWN key via
