@@ -1,7 +1,8 @@
 import WebSocket from "ws";
 import { BaseProvider, round, synthBook } from "./provider.js";
 import { aggregateCandles } from "./databento-shared.js";
-import { INSTRUMENTS, getInstrument } from "../instruments.js";
+import { INSTRUMENTS, getInstrument, type Category } from "../instruments.js";
+import { computeDxFeedDatedSymbol } from "../contract-code.js";
 import type { Candle } from "../types.js";
 
 /* ------------------------------------------------------------------ *
@@ -35,15 +36,22 @@ const CHANNEL_FEED = 1; // live Quote/Trade/Summary
 const CHANNEL_HIST = 3; // on-demand Candle snapshots
 const LIVE_BAR_CAP = 1500; // ~25h of live-built 1-minute bars per symbol
 
+/** CME exchange suffix per root (continuous form: /NQ:XCME). */
+const EXCHANGE_BY_ROOT: Record<string, string> = {
+  ES: "XCME", MES: "XCME",
+  NQ: "XCME", MNQ: "XCME",
+  YM: "XCBT", MYM: "XCBT",
+  CL: "XNYM", MCL: "XNYM",
+  GC: "XCEC", MGC: "XCEC",
+};
+
 /**
- * Internal symbol → dxFeed symbol. Kept LOCAL to this provider so instruments.ts
- * (shared with the Databento path) stays untouched. These are CME continuous-
- * futures placeholders in dxFeed symbology — override per deploy with
- * DXFEED_SYMBOL_MAP (JSON, e.g. {"ES":"/ESU25:XCME"}). On the public demo feed
- * futures aren't entitled, so DXFEED_DEMO=1 swaps in liquid demo equities/FX to
- * validate the wiring end-to-end.
+ * Continuous-futures placeholders. Prefer dated front-month symbols at runtime
+ * (see buildDatedSymbolMap) — many entitled endpoints stream trades/candles on
+ * /NQU26:XCME while continuous /NQ:XCME only quotes. Override with
+ * DXFEED_SYMBOL_MAP JSON when needed.
  */
-const DEFAULT_SYMBOL_MAP: Record<string, string> = {
+const CONTINUOUS_SYMBOL_MAP: Record<string, string> = {
   ES: "/ES:XCME", MES: "/MES:XCME",
   NQ: "/NQ:XCME", MNQ: "/MNQ:XCME",
   YM: "/YM:XCBT", MYM: "/MYM:XCBT",
@@ -57,6 +65,9 @@ const DEMO_SYMBOL_MAP: Record<string, string> = {
   CL: "USO", MCL: "USO", GC: "GLD", MGC: "GLD",
 };
 
+/** Month codes used when stripping a dated CME root from an eventSymbol. */
+const MONTH_CODE_RE = /[FGHJKMNQUVXZ]\d{1,2}$/;
+
 interface SymState {
   price: number;
   bid: number;
@@ -67,6 +78,8 @@ interface SymState {
   low: number;
   volume: number;
   havePrice: boolean;
+  /** True once a Trade print has set the price (prefer trades over quote mids). */
+  haveTrade: boolean;
 }
 
 interface HistPending {
@@ -140,20 +153,57 @@ export class DxFeedProvider extends BaseProvider {
         console.warn("[dxfeed] DXFEED_SYMBOL_MAP is not valid JSON — ignoring");
       }
     }
-    const base = isDemo ? DEMO_SYMBOL_MAP : DEFAULT_SYMBOL_MAP;
+    const base = isDemo ? DEMO_SYMBOL_MAP : buildDatedSymbolMap();
     for (const inst of INSTRUMENTS) {
       const dx = override[inst.symbol] ?? base[inst.symbol];
       if (!dx) continue;
       this.toDx.set(inst.symbol, dx);
-      const shared = this.fromDx.get(dx);
-      if (shared) shared.push(inst.symbol);
-      else this.fromDx.set(dx, [inst.symbol]);
+      this.linkDxAlias(dx, inst.symbol);
+      // Also accept continuous-form events (/NQ:XCME) even when subscribed dated.
+      const continuous = CONTINUOUS_SYMBOL_MAP[inst.symbol];
+      if (continuous && continuous !== dx) this.linkDxAlias(continuous, inst.symbol);
       this.state.set(inst.symbol, {
         price: inst.simBase, bid: 0, ask: 0, dayOpen: 0, prevClose: 0,
-        high: 0, low: 0, volume: 0, havePrice: false,
+        high: 0, low: 0, volume: 0, havePrice: false, haveTrade: false,
       });
     }
     if (isDemo) console.log("[dxfeed] DEMO symbol map active (equity/FX stand-ins for futures)");
+    else {
+      const sample = [...this.toDx.entries()].map(([k, v]) => `${k}=${v}`).join(", ");
+      console.log(`[dxfeed] symbol map: ${sample}`);
+    }
+  }
+
+  /** Register eventSymbol → internal root (supports many internals per dx symbol). */
+  private linkDxAlias(dx: string, internal: string): void {
+    const shared = this.fromDx.get(dx);
+    if (shared) {
+      if (!shared.includes(internal)) shared.push(internal);
+    } else {
+      this.fromDx.set(dx, [internal]);
+    }
+  }
+
+  /**
+   * Resolve FEED_DATA eventSymbol → internal roots.
+   * Exact match first, then strip candle period, then dated → root fuzzy match
+   * so /NQU26:XCME still updates NQ when we subscribed /NQ:XCME (or vice versa).
+   */
+  private resolveEventSymbols(eventSymbol: string): string[] | undefined {
+    const exact = this.fromDx.get(eventSymbol);
+    if (exact) return exact;
+
+    const base = eventSymbol.replace(/\{=[^}]*\}$/, "");
+    const exactBase = this.fromDx.get(base);
+    if (exactBase) return exactBase;
+
+    // /NQU26:XCME or NQU26 → root NQ
+    const bare = base.startsWith("/") ? base.slice(1) : base;
+    const product = bare.split(":")[0] ?? bare;
+    const root = product.replace(MONTH_CODE_RE, "");
+    if (root && this.state.has(root)) return [root];
+
+    return undefined;
   }
 
   start(): void {
@@ -321,14 +371,20 @@ export class DxFeedProvider extends BaseProvider {
           Summary: ["eventType", "eventSymbol", "dayOpenPrice", "dayHighPrice", "dayLowPrice", "prevDayClosePrice"],
         },
       });
-      // Subscribe every mapped instrument for Quote + Trade + Summary.
-      const add = [...this.toDx.values()].flatMap((sym) => [
+      // Subscribe every mapped instrument — dated primary + continuous alias.
+      const symbols = new Set<string>();
+      for (const [root, dx] of this.toDx) {
+        symbols.add(dx);
+        const continuous = CONTINUOUS_SYMBOL_MAP[root];
+        if (continuous) symbols.add(continuous);
+      }
+      const add = [...symbols].flatMap((sym) => [
         { type: "Quote", symbol: sym },
         { type: "Trade", symbol: sym },
         { type: "Summary", symbol: sym },
       ]);
       this.send({ type: "FEED_SUBSCRIPTION", channel: CHANNEL_FEED, add });
-      console.log(`[dxfeed] subscribed ${this.toDx.size} instruments (Quote/Trade/Summary)`);
+      console.log(`[dxfeed] subscribed ${symbols.size} feed symbols (Quote/Trade/Summary)`);
     } else if (channel === CHANNEL_HIST) {
       this.send({
         type: "FEED_SETUP",
@@ -353,7 +409,7 @@ export class DxFeedProvider extends BaseProvider {
         this.onCandle(e);
         continue;
       }
-      const symbols = this.fromDx.get(String(e.eventSymbol));
+      const symbols = this.resolveEventSymbols(String(e.eventSymbol));
       if (!symbols) continue;
       for (const symbol of symbols) {
         const st = this.state.get(symbol);
@@ -379,6 +435,7 @@ export class DxFeedProvider extends BaseProvider {
     const first = !st.havePrice;
     st.price = price;
     st.havePrice = true;
+    st.haveTrade = true;
     st.volume = num(e.dayVolume) || st.volume;
     if (st.high) st.high = Math.max(st.high, price);
     if (st.low) st.low = Math.min(st.low, price);
@@ -412,8 +469,19 @@ export class DxFeedProvider extends BaseProvider {
     const ask = num(e.askPrice);
     if (bid > 0) st.bid = bid;
     if (ask > 0) st.ask = ask;
-    // Before the first trade, use the mid as the price so charts/marks aren't $0.
-    if (!st.havePrice && st.bid > 0 && st.ask > 0) st.price = (st.bid + st.ask) / 2;
+    if (st.bid > 0 && st.ask > 0) {
+      const mid = (st.bid + st.ask) / 2;
+      // Prefer trade prints for the last price; use mid until the first trade.
+      if (!st.haveTrade) {
+        const first = !st.havePrice;
+        st.price = mid;
+        st.havePrice = true;
+        if (first) console.log(`[dxfeed] first quote ${symbol} mid @ ${mid}`);
+        // Build chart bars from quote mids when Trade events are silent (common
+        // for continuous NQ while dated contracts still print).
+        this.recordLiveBar(symbol, mid, 0);
+      }
+    }
     this.emitQuote(symbol, st, 0);
   }
 
@@ -422,6 +490,17 @@ export class DxFeedProvider extends BaseProvider {
     st.high = num(e.dayHighPrice) || st.high;
     st.low = num(e.dayLowPrice) || st.low;
     st.prevClose = num(e.prevDayClosePrice) || st.prevClose;
+    // Never leave price stuck on simBase while Summary has live session levels —
+    // that produces fake 24h % moves (seed price vs real prevClose) and a blank chart.
+    if (!st.havePrice) {
+      const px = st.high || st.dayOpen || st.prevClose;
+      if (px > 0) {
+        st.price = px;
+        st.havePrice = true;
+        this.recordLiveBar(symbol, px, 0);
+        console.log(`[dxfeed] first summary ${symbol} @ ${px}`);
+      }
+    }
     this.emitQuote(symbol, st, 0);
   }
 
@@ -508,15 +587,15 @@ export class DxFeedProvider extends BaseProvider {
 
   private onCandle(e: Record<string, unknown>): void {
     const candleSymbol = String(e.eventSymbol);
-    const pending = this.hist.get(candleSymbol);
+    const pending = this.findHistPending(candleSymbol);
     if (!pending) return;
     const timeSec = Math.floor(num(e.time) / 1000);
     const close = num(e.close);
     // dxFeed emits a synthetic snapshot-boundary event with NaN/empty OHLC (→ 0 here)
     // to mark the end of the history snapshot — skip it so only real bars are returned.
     if (!timeSec || close <= 0) return;
-    const p = pending.precision;
-    pending.bars.set(timeSec, {
+    const p = pending.entry.precision;
+    pending.entry.bars.set(timeSec, {
       time: timeSec,
       open: round(num(e.open), p),
       high: round(num(e.high), p),
@@ -525,8 +604,30 @@ export class DxFeedProvider extends BaseProvider {
       volume: Math.max(0, Math.round(num(e.volume))),
     });
     // Reset the idle timer — snapshot is "complete" once bars stop flowing.
-    clearTimeout(pending.idle);
-    pending.idle = setTimeout(() => this.finishHistory(candleSymbol), HISTORY_IDLE_MS);
+    clearTimeout(pending.entry.idle);
+    pending.entry.idle = setTimeout(() => this.finishHistory(pending.key), HISTORY_IDLE_MS);
+  }
+
+  /** Match candle events even when dxFeed rewrites continuous → dated in eventSymbol. */
+  private findHistPending(candleSymbol: string): { key: string; entry: HistPending } | null {
+    const direct = this.hist.get(candleSymbol);
+    if (direct) return { key: candleSymbol, entry: direct };
+
+    const base = candleSymbol.replace(/\{=[^}]*\}$/, "");
+    const period = candleSymbol.match(/\{=([^}]*)\}$/)?.[1];
+    for (const [key, entry] of this.hist) {
+      const keyBase = key.replace(/\{=[^}]*\}$/, "");
+      const keyPeriod = key.match(/\{=([^}]*)\}$/)?.[1];
+      if (period && keyPeriod && period !== keyPeriod) continue;
+      if (keyBase === base) return { key, entry };
+      // Same product root (dated vs continuous).
+      const a = (base.startsWith("/") ? base.slice(1) : base).split(":")[0] ?? "";
+      const b = (keyBase.startsWith("/") ? keyBase.slice(1) : keyBase).split(":")[0] ?? "";
+      const rootA = a.replace(MONTH_CODE_RE, "");
+      const rootB = b.replace(MONTH_CODE_RE, "");
+      if (rootA && rootA === rootB) return { key, entry };
+    }
+    return null;
   }
 
   private finishHistory(candleSymbol: string): void {
@@ -540,6 +641,18 @@ export class DxFeedProvider extends BaseProvider {
     const bars = [...pending.bars.values()].sort((a, b) => a.time - b.time);
     pending.resolve(bars);
   }
+}
+
+/** Prefer dated front-month CME symbols — continuous often quotes without trades/candles. */
+function buildDatedSymbolMap(): Record<string, string> {
+  const now = Date.now();
+  const map: Record<string, string> = {};
+  for (const inst of INSTRUMENTS) {
+    const exchange = EXCHANGE_BY_ROOT[inst.symbol];
+    if (!exchange) continue;
+    map[inst.symbol] = computeDxFeedDatedSymbol(inst.symbol, inst.category as Category, exchange, now);
+  }
+  return map;
 }
 
 /** Coerce a dxFeed numeric field (may be number, numeric string, or "NaN") to a number. */

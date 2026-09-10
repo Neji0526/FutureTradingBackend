@@ -13,7 +13,7 @@ function cycleMonths(category: Category): number[] {
   return [3, 6, 9, 12]; // Equity Index quarterly: H M U Z
 }
 
-export function computeContractCode(root: string, category: Category, dateMs: number): string {
+function resolveFrontMonth(category: Category, dateMs: number): { month: number; year: number } {
   const d = new Date(dateMs);
   const year = d.getUTCFullYear();
   const month = d.getUTCMonth() + 1; // 1-12
@@ -33,5 +33,23 @@ export function computeContractCode(root: string, category: Category, dateMs: nu
     activeYear = y;
     break;
   }
-  return `${root}${MONTH_CODES[activeMonth - 1]}${activeYear % 10}`;
+  return { month: activeMonth, year: activeYear };
+}
+
+/** Display code with 1-digit year (e.g. NQU6). */
+export function computeContractCode(root: string, category: Category, dateMs: number): string {
+  const { month, year } = resolveFrontMonth(category, dateMs);
+  return `${root}${MONTH_CODES[month - 1]}${year % 10}`;
+}
+
+/** dxFeed dated CME code with 2-digit year (e.g. NQU26 → /NQU26:XCME). */
+export function computeDxFeedDatedSymbol(
+  root: string,
+  category: Category,
+  exchange: string,
+  dateMs: number = Date.now(),
+): string {
+  const { month, year } = resolveFrontMonth(category, dateMs);
+  const yy = String(year % 100).padStart(2, "0");
+  return `/${root}${MONTH_CODES[month - 1]}${yy}:${exchange}`;
 }
