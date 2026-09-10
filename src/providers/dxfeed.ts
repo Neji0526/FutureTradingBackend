@@ -145,6 +145,9 @@ export class DxFeedProvider extends BaseProvider {
   private candleEmptyStreak = 0;
   /** feedRoot → retry Candle snapshots after this epoch ms (empty-result backoff). */
   private candleMissUntil = new Map<string, number>();
+  /** Exchange codes returned by the auth mint (e.g. CMEfod, COMEXfod). Empty = unknown. */
+  private entitledExchanges: string[] = [];
+  private warnedMissingExchange = new Set<string>();
   /* Live-built 1-minute bars per symbol, oldest first.
    *
    * Candle history is a SEPARATE dxFeed entitlement from streaming quotes, and an
@@ -309,11 +312,27 @@ export class DxFeedProvider extends BaseProvider {
           n += kept.length;
         }
       }
+      // Micros share the parent's price stream — keep both buffers filled so MES
+      // never looks empty while ES has depth (and the same for MNQ/MYM/MGC/MCL).
+      this.syncPiggybackLiveBars();
       if (n) console.log(`[dxfeed] restored ${n} live bars from disk`);
     } catch (err) {
       console.warn("[dxfeed] could not load live bars:", (err as Error).message);
     }
     this.liveBarsSaveTimer = setInterval(() => this.saveLiveBars(), LIVE_BARS_SAVE_MS);
+  }
+
+  /** Copy the richer live-bar series across each parent↔micro pair. */
+  private syncPiggybackLiveBars(): void {
+    for (const [micro, parent] of Object.entries(PARENT_OF)) {
+      const a = this.liveBars.get(parent) ?? [];
+      const b = this.liveBars.get(micro) ?? [];
+      if (a.length >= b.length && a.length) {
+        this.liveBars.set(micro, a.map((c) => ({ ...c })));
+      } else if (b.length > a.length) {
+        this.liveBars.set(parent, b.map((c) => ({ ...c })));
+      }
+    }
   }
 
   private saveLiveBars(): void {
@@ -373,10 +392,54 @@ export class DxFeedProvider extends BaseProvider {
       }
       this.activeEndpoint = endpoint;
       this.activeToken = token;
-      const exchanges = Array.isArray(data.dataExchanges) ? data.dataExchanges.join(", ") : "?";
+      this.entitledExchanges = Array.isArray(data.dataExchanges)
+        ? (data.dataExchanges as unknown[]).map((x) => String(x))
+        : [];
+      const exchanges = this.entitledExchanges.length ? this.entitledExchanges.join(", ") : "?";
       console.log(`[dxfeed] minted market-data credentials — exchanges: ${exchanges}`);
+      this.warnMissingExchangeEntitlements();
     } catch (err) {
       console.warn("[dxfeed] auth request failed:", (err as Error).message, "— using the last known endpoint/token");
+    }
+  }
+
+  /**
+   * Map product roots → exchange family keywords we expect in dataExchanges
+   * (Volumetrica uses names like CMEfod / CBOTfod / COMEXfod / NYMEXfod).
+   */
+  private exchangeFamilyForRoot(root: string): string | null {
+    const ex = EXCHANGE_BY_ROOT[root];
+    if (!ex) return null;
+    if (ex === "XCME") return "CME";
+    if (ex === "XCBT") return "CBOT";
+    if (ex === "XCEC") return "COMEX";
+    if (ex === "XNYM") return "NYMEX";
+    return null;
+  }
+
+  private isRootEntitled(root: string): boolean {
+    if (!this.entitledExchanges.length) return true; // unknown → don't block
+    const family = this.exchangeFamilyForRoot(root);
+    if (!family) return true;
+    const hay = this.entitledExchanges.join(" ").toUpperCase();
+    return hay.includes(family);
+  }
+
+  private warnMissingExchangeEntitlements(): void {
+    const needed = [
+      ["ES/MES/NQ/MNQ", "ES"],
+      ["YM/MYM", "YM"],
+      ["GC/MGC", "GC"],
+      ["CL/MCL", "CL"],
+    ] as const;
+    for (const [label, root] of needed) {
+      if (this.isRootEntitled(root)) continue;
+      if (this.warnedMissingExchange.has(root)) continue;
+      this.warnedMissingExchange.add(root);
+      const family = this.exchangeFamilyForRoot(root);
+      console.warn(
+        `[dxfeed] feed has no ${family} entitlement — ${label} will stay empty until that exchange is enabled on the dxFeed account`,
+      );
     }
   }
 
@@ -701,6 +764,18 @@ export class DxFeedProvider extends BaseProvider {
     const feedRoot = PARENT_OF[symbol] ?? symbol;
     const missUntil = this.candleMissUntil.get(feedRoot) ?? 0;
 
+    // No exchange entitlement (e.g. CL without NYMEX) — skip Candle wait, live bars only.
+    if (!this.isRootEntitled(feedRoot)) {
+      if (!this.warnedMissingExchange.has(feedRoot)) {
+        this.warnedMissingExchange.add(feedRoot);
+        const family = this.exchangeFamilyForRoot(feedRoot);
+        console.warn(
+          `[dxfeed] skipping candle history for ${symbol}: no ${family} entitlement on this feed`,
+        );
+      }
+      return this.mergeLiveBars(symbol, [], resolutionSec, want);
+    }
+
     // Wait briefly for the HISTORY channel — chart loads often race the socket setup.
     if (!this.channelOpen.get(CHANNEL_HIST)) {
       await waitFor(() => this.channelOpen.get(CHANNEL_HIST) === true, 2_500);
@@ -712,6 +787,11 @@ export class DxFeedProvider extends BaseProvider {
     if (this.channelOpen.get(CHANNEL_HIST) && this.candleEntitled !== false && Date.now() >= missUntil) {
       const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[symbol];
       const candidates = continuous && continuous !== dx ? [continuous, dx] : [dx];
+      // Energy: also try the prior month contract around rolls.
+      if (feedRoot === "CL") {
+        const prev = previousDatedSymbol("CL", "Energy", "XNYM");
+        if (prev && !candidates.includes(prev)) candidates.push(prev);
+      }
       const results = await Promise.all(
         candidates.map((sym) => this.candleSnapshot(sym, inst.pricePrecision, resolutionSec, want)),
       );
@@ -780,9 +860,13 @@ export class DxFeedProvider extends BaseProvider {
    *  Serves two cases with one path: an endpoint WITH candle history gets its
    *  publication-lag seam closed, and one WITHOUT (the demo host) gets a chart at
    *  all. Only bars strictly newer than the snapshot are appended, so a real
-   *  snapshot always wins where the two overlap. */
+   *  snapshot always wins where the two overlap.
+   *
+   *  Micros (MES/MNQ/…) reuse the parent's live-bar buffer when richer, so a
+   *  micro chart never lags its mini just because only the parent accumulated bars.
+   */
   private mergeLiveBars(symbol: string, snapshot: Candle[], resolutionSec: number, count: number): Candle[] {
-    const live = this.liveBars.get(symbol);
+    const live = this.richestLiveBars(symbol);
     const pad = (!snapshot.length && resolutionSec >= 60) ? this.sessionPadBars(symbol, resolutionSec, count) : [];
     // The buffer is minute-grained, so it cannot build sub-minute resolutions.
     if (resolutionSec < 60) return snapshot.slice(-count);
@@ -791,6 +875,15 @@ export class DxFeedProvider extends BaseProvider {
     const padTail = pad.filter((c) => c.time > lastSnapshot && (!liveAgg.length || c.time < liveAgg[0]!.time));
     const merged = [...snapshot, ...padTail, ...liveAgg];
     return merged.slice(-count);
+  }
+
+  /** Prefer the denser of this symbol's bars and its parent/micro twin. */
+  private richestLiveBars(symbol: string): Candle[] | undefined {
+    const own = this.liveBars.get(symbol);
+    const twinName = MICRO_OF[symbol] ?? PARENT_OF[symbol];
+    const twin = twinName ? this.liveBars.get(twinName) : undefined;
+    if ((twin?.length ?? 0) > (own?.length ?? 0)) return twin;
+    return own;
   }
 
   private onCandle(e: Record<string, unknown>): void {
