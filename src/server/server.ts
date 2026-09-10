@@ -242,6 +242,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/account/request-reset" && req.method === "POST") {
     return handleRequestReset(req, res, opts.accountStream);
   }
+  if (url.pathname === "/api/account/deactivate-subscription" && req.method === "POST") {
+    return handleSelfDeactivateSubscription(req, res, opts.auth, opts.users, opts.accountStream);
+  }
   if (url.pathname === "/api/transactions" && req.method === "GET") {
     return handleTransactions(req, res);
   }
@@ -483,6 +486,28 @@ async function handleAdminDeactivateSubscription(
   const result = await handleDeactivateSubscription(userId, users);
   if (!result.ok) return json(res, 404, { ok: false, error: result.error ?? "trader not found" });
   accountStream.publishAdminUpdate({ kind: "trader_suspended", id: userId });
+  json(res, 200, { ok: true, purchasesRemoved: result.purchasesRemoved });
+}
+
+/** Trader self-service: cancel own subscription, wipe purchase, block future login. */
+async function handleSelfDeactivateSubscription(
+  req: IncomingMessage,
+  res: ServerResponse,
+  auth: AuthService,
+  users: UserStore,
+  accountStream: AccountStream,
+) {
+  const token = bearerToken(req.headers.authorization);
+  if (!token) return json(res, 401, { error: "Not authenticated." });
+  const me = await auth.me(token);
+  if (!me) return json(res, 401, { error: "invalid or expired token" });
+  if (me.role !== "TRADER") {
+    return json(res, 403, { error: "Only traders can deactivate a subscription from the account page." });
+  }
+
+  const result = await handleDeactivateSubscription(me.id, users);
+  if (!result.ok) return json(res, 404, { ok: false, error: result.error ?? "Could not deactivate subscription." });
+  accountStream.publishAdminUpdate({ kind: "trader_suspended", id: me.id });
   json(res, 200, { ok: true, purchasesRemoved: result.purchasesRemoved });
 }
 
