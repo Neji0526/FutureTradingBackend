@@ -59,6 +59,7 @@ import {
   handleOnboardingComplete,
   handlePurchaseValidate,
 } from "../purchases/handlers.js";
+import { getMarketLiveState } from "../market-data/live-console.js";
 import { getPool } from "../db/pool.js";
 
 interface ServerOptions {
@@ -329,6 +330,10 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   // exact negation of what the admin sees, not a candle-derived approximation.
   if (url.pathname === "/api/market/marks" && req.method === "GET") {
     return handleMarketMarks(url, req, res, opts.accountStream);
+  }
+  // All-instrument live quote health — same rows printed to Railway stdout.
+  if (url.pathname === "/api/market/live-state" && req.method === "GET") {
+    return json(res, 200, getMarketLiveState());
   }
 
   json(res, 404, { error: "not found" });

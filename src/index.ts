@@ -18,6 +18,7 @@ import { OrderEngine } from "./trading/order-engine.js";
 import { RiskEngine } from "./trading/risk-engine.js";
 import { startResetSweeper } from "./trading/reset-sweeper.js";
 import { startMarkPublisher, stopMarkPublisher } from "./realtime/mark-publisher.js";
+import { startMarketLiveConsole } from "./market-data/live-console.js";
 
 
 function buildProvider(): MarketDataProvider {
@@ -76,6 +77,7 @@ if (useDatabase) {
 const provider = buildProvider();
 const hub = new MarketHub(provider);
 hub.start();
+const stopMarketConsole = startMarketLiveConsole(provider);
 
 // Real-time gateway for authenticated channels (positions/account/orders/admin).
 const accountStream = new AccountStream(provider);
@@ -174,6 +176,7 @@ server.listen(config.port, () => {
   console.log(`  Instruments  http://localhost:${config.port}/api/instruments`);
   console.log(`  Auth         POST http://localhost:${config.port}/api/auth/login  ·  GET /api/auth/me`);
   console.log(`  Health       http://localhost:${config.port}/health`);
+  console.log(`  Live state   http://localhost:${config.port}/api/market/live-state`);
   console.log(`  Symbols      ${SYMBOLS.join(", ")}`);
 
   // Auto-seed demo data on a fresh DB (SEED_DEMO=1 only). Runs after the server
@@ -185,6 +188,7 @@ server.listen(config.port, () => {
 
 function shutdown() {
   console.log("\nShutting down…");
+  stopMarketConsole();
   hub.stop();
   houseFeed?.stop();
   accountStream.stop();
