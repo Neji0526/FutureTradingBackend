@@ -35,10 +35,12 @@ const BOOK_THROTTLE_MS = 200;
 // often take 1–3s before the first Candle event, and a pre-armed 700ms idle
 // was finishing empty (blank charts, volume stuck at 0).
 const HISTORY_IDLE_MS = 1_200;
-/** Overall cap per candle request. Keep short — if nothing arrives, fall back to live bars. */
-const HISTORY_MAX_MS = 3_500;
+/** Overall cap per candle request. No Candle entitlement → empty after this, then live bars. */
+const HISTORY_MAX_MS = 2_500;
 /** Cap how far back we ask dxFeed for candles (large windows stall or empty-out). */
 const HISTORY_MAX_BARS = 2_500;
+/** After an empty Candle snapshot, retry this root no sooner than this (ms). */
+const CANDLE_MISS_BACKOFF_MS = 45_000;
 const LIVE_BARS_FILE = path.join(process.cwd(), "data", "dxfeed-live-bars.json");
 const LIVE_BARS_SAVE_MS = 15_000;
 
@@ -130,8 +132,14 @@ export class DxFeedProvider extends BaseProvider {
   private readonly bookEmitAt = new Map<string, number>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
   private readonly hist = new Map<string, HistPending>();
-  /** null = unknown; false = this endpoint returns no Candle events (skip waiting). */
+  /**
+   * null = unknown; true = at least one product returned Candle history.
+   * Never flip to false from a single empty product (CL without NYMEX used to
+   * poison NQ/YM/GC and skip Candle waits for every chart).
+   */
   private candleEntitled: boolean | null = null;
+  /** feedRoot → retry Candle snapshots after this epoch ms (empty-result backoff). */
+  private candleMissUntil = new Map<string, number>();
   /* Live-built 1-minute bars per symbol, oldest first.
    *
    * Candle history is a SEPARATE dxFeed entitlement from streaming quotes, and an
@@ -653,21 +661,34 @@ export class DxFeedProvider extends BaseProvider {
     if (!inst || !dx) return [];
     const want = Math.min(Math.max(1, count), HISTORY_MAX_BARS);
     let snapshot: Candle[] = [];
-    // Once we know this gateway has no Candle entitlement, don't block chart loads.
-    if (this.channelOpen.get(CHANNEL_HIST) && this.candleEntitled !== false) {
-      const feedRoot = PARENT_OF[symbol] ?? symbol;
+    const feedRoot = PARENT_OF[symbol] ?? symbol;
+    const missUntil = this.candleMissUntil.get(feedRoot) ?? 0;
+
+    // Wait briefly for the HISTORY channel — chart loads often race the socket setup.
+    if (!this.channelOpen.get(CHANNEL_HIST)) {
+      await waitFor(() => this.channelOpen.get(CHANNEL_HIST) === true, 2_500);
+    }
+
+    // Per-root backoff after an empty snapshot — never disable Candle globally.
+    if (this.channelOpen.get(CHANNEL_HIST) && Date.now() >= missUntil) {
       const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[symbol];
-      const candidates = continuous && continuous !== dx ? [dx, continuous] : [dx];
-      for (const sym of candidates) {
-        const bars = await this.candleSnapshot(sym, inst.pricePrecision, resolutionSec, want);
+      // Prefer continuous for history (often better entitled); dated as fallback.
+      // Run in parallel so two empty waits don't stack to 2× timeout.
+      const candidates = continuous && continuous !== dx ? [continuous, dx] : [dx];
+      const results = await Promise.all(
+        candidates.map((sym) => this.candleSnapshot(sym, inst.pricePrecision, resolutionSec, want)),
+      );
+      for (const bars of results) {
         if (bars.length > snapshot.length) snapshot = bars;
-        if (snapshot.length > 0) break; // don't wait on a second symbol if the first worked
       }
       if (snapshot.length === 0) {
-        this.candleEntitled = false;
-        console.warn(`[dxfeed] candle snapshot empty for ${symbol} — live bars only (skipping further Candle waits)`);
+        this.candleMissUntil.set(feedRoot, Date.now() + CANDLE_MISS_BACKOFF_MS);
+        console.warn(
+          `[dxfeed] candle snapshot empty for ${symbol} — live bars only (retry ${feedRoot} in ${CANDLE_MISS_BACKOFF_MS / 1000}s)`,
+        );
       } else {
         this.candleEntitled = true;
+        this.candleMissUntil.delete(feedRoot);
         console.log(`[dxfeed] candle snapshot ${symbol}: ${snapshot.length} bars`);
       }
     }
@@ -675,30 +696,12 @@ export class DxFeedProvider extends BaseProvider {
   }
 
   /**
-   * When Candle entitlement is missing and the live buffer is still thin, pad
-   * flat session bars from day-open (or prev close) up to the first live print.
-   * Honest placeholders (volume 0) so the chart isn't a blank price line.
+   * Flat session pads stretch the time axis so a handful of real live bars become
+   * invisible hairlines (or a blank pane). Prefer an honest short live series —
+   * the chart fitContent will zoom to real candles like ES.
    */
-  private sessionPadBars(symbol: string, resolutionSec: number, count: number): Candle[] {
-    if (resolutionSec < 60) return [];
-    const st = this.state.get(symbol);
-    const inst = getInstrument(symbol);
-    if (!st?.havePrice || !inst) return [];
-    const live = this.liveBars.get(symbol) ?? [];
-    if (live.length >= 60) return []; // ~1h of real ticks is enough for a readable chart
-    const anchor = st.dayOpen || st.prevClose || (st.havePrice ? st.price : 0);
-    if (!(anchor > 0)) return [];
-    const firstLive = live[0]?.time;
-    const end = firstLive ?? Math.floor(Date.now() / 1000 / resolutionSec) * resolutionSec;
-    // Keep pad short so the chart doesn't look like a flat empty line.
-    const padCount = Math.min(count, live.length > 0 ? 90 : 240);
-    const start = end - padCount * resolutionSec;
-    const pad: Candle[] = [];
-    const px = round(anchor, inst.pricePrecision);
-    for (let t = start; t < end; t += resolutionSec) {
-      pad.push({ time: t, open: px, high: px, low: px, close: px, volume: 0 });
-    }
-    return pad;
+  private sessionPadBars(_symbol: string, _resolutionSec: number, _count: number): Candle[] {
+    return [];
   }
 
   /** Ask dxFeed for a Candle snapshot. Empty when the endpoint has no candle
@@ -840,4 +843,18 @@ function candlePeriod(sec: number): string {
   if (sec % 86400 === 0) return `${sec / 86400}d`;
   if (sec % 3600 === 0) return `${sec / 3600}h`;
   return `${Math.max(1, Math.round(sec / 60))}m`;
+}
+
+/** Resolve when `pred` is true, or after `ms` timeout (whichever first). */
+function waitFor(pred: () => boolean, ms: number): Promise<void> {
+  if (pred()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const id = setInterval(() => {
+      if (pred() || Date.now() - start >= ms) {
+        clearInterval(id);
+        resolve();
+      }
+    }, 50);
+  });
 }
