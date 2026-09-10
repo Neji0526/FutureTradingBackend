@@ -139,8 +139,8 @@ export async function handleOnboardingComplete(
   const country = body.country?.trim().toUpperCase() ?? "";
   const acceptTerms = asBool(body.acceptTerms);
   const acceptRisk = asBool(body.acceptRisk);
-  const idType = body.idType?.trim() ?? "";
-  const addressType = body.addressType?.trim() ?? "";
+  const idType = body.idType?.trim() || "";
+  const addressType = body.addressType?.trim() || "";
   const idDocument = body.idDocument ?? {};
   const addressDocument = body.addressDocument ?? {};
 
@@ -151,13 +151,7 @@ export async function handleOnboardingComplete(
   if (!ageRange) return json(res, 400, { error: "Age range is required." });
   if (!COUNTRY_RE.test(country)) return json(res, 400, { error: "Country is required." });
   if (!acceptTerms) return json(res, 400, { error: "You must accept the terms." });
-  if (!acceptRisk) return json(res, 400, { error: "You must acknowledge the risk disclosure." });
-  if (!idType) return json(res, 400, { error: "Identity document type is required." });
-  if (!addressType) return json(res, 400, { error: "Address document type is required." });
-  if (!isValidDoc(idDocument)) return json(res, 400, { error: "Identity document upload is required." });
-  if (!isValidDoc(addressDocument)) {
-    return json(res, 400, { error: "Proof of address upload is required." });
-  }
+  if (!acceptRisk) return json(res, 400, { error: "You must confirm the trading rules." });
 
   const store = getPurchaseStore();
   const purchase = await store.findByOrderNumber(orderNumber);
@@ -194,14 +188,14 @@ export async function handleOnboardingComplete(
       acceptRisk,
       idType,
       addressType,
-      idFileName: String(idDocument.fileName),
-      idFilePath: String(idDocument.storedPath),
-      idMimeType: String(idDocument.mimeType),
-      idSize: Number(idDocument.size),
-      addressFileName: String(addressDocument.fileName),
-      addressFilePath: String(addressDocument.storedPath),
-      addressMimeType: String(addressDocument.mimeType),
-      addressSize: Number(addressDocument.size),
+      idFileName: String(idDocument.fileName ?? ""),
+      idFilePath: String(idDocument.storedPath ?? ""),
+      idMimeType: String(idDocument.mimeType ?? ""),
+      idSize: Number(idDocument.size ?? 0),
+      addressFileName: String(addressDocument.fileName ?? ""),
+      addressFilePath: String(addressDocument.storedPath ?? ""),
+      addressMimeType: String(addressDocument.mimeType ?? ""),
+      addressSize: Number(addressDocument.size ?? 0),
     });
   } catch (e) {
     console.error("[onboarding] profile save failed:", (e as Error).message);
@@ -227,17 +221,6 @@ export async function handleOnboardingComplete(
     orderNumber: redeemed.orderNumber,
     email: redeemed.email,
   });
-}
-
-function isValidDoc(doc: UploadedDocMeta): boolean {
-  return Boolean(
-    doc.fileName?.trim() &&
-      doc.storedPath?.trim() &&
-      doc.mimeType?.trim() &&
-      typeof doc.size === "number" &&
-      Number.isFinite(doc.size) &&
-      doc.size > 0,
-  );
 }
 
 function asBool(v: unknown): boolean {
