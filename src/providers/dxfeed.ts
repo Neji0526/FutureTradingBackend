@@ -722,11 +722,20 @@ export class DxFeedProvider extends BaseProvider {
     this.lastEmittedPrice.set(symbol, price);
     // Prefer prev-day close for the 24h change baseline; fall back to the day open.
     const base = st.prevClose > 0 ? st.prevClose : st.dayOpen;
-    // dayVolume only arrives on Trade events; when those are sparse, sum live 1m bars.
+    // dayVolume only arrives on Trade events; when those are sparse, sum live 1m bars
+    // (parent↔micro twin included) so MNQ/YM headers don't stay at volume=0 while ES looks live.
+    const bars = this.richestLiveBars(symbol);
     let volume24h = Math.round(st.volume);
-    if (volume24h <= 0) {
-      const bars = this.liveBars.get(symbol);
-      if (bars?.length) volume24h = Math.round(bars.reduce((s, b) => s + (b.volume ?? 0), 0));
+    if (volume24h <= 0 && bars?.length) {
+      volume24h = Math.round(bars.reduce((s, b) => s + (b.volume ?? 0), 0));
+    }
+    let high24 = st.high > 0 ? Math.max(st.high, price) : price;
+    let low24 = st.low > 0 ? Math.min(st.low, price) : price;
+    if (bars?.length) {
+      for (const b of bars) {
+        if (b.high > high24) high24 = b.high;
+        if (b.low > 0 && b.low < low24) low24 = b.low;
+      }
     }
     this.emit("quote", {
       symbol,
@@ -734,8 +743,8 @@ export class DxFeedProvider extends BaseProvider {
       bid: round(bid, p),
       ask: round(ask, p),
       change24h: base > 0 ? (price - base) / base : 0,
-      high24h: round(st.high > 0 ? Math.max(st.high, price) : price, p),
-      low24h: round(st.low > 0 ? Math.min(st.low, price) : price, p),
+      high24h: round(high24, p),
+      low24h: round(low24, p),
       volume24h,
       lastSize,
       ts: now,
