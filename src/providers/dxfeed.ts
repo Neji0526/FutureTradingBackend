@@ -1,4 +1,6 @@
 import WebSocket from "ws";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import path from "node:path";
 import { BaseProvider, round, synthBook } from "./provider.js";
 import { aggregateCandles } from "./databento-shared.js";
 import { INSTRUMENTS, getInstrument, type Category } from "../instruments.js";
@@ -28,9 +30,17 @@ const MAX_BACKOFF_MS = 15_000;
 const PROTOCOL_VERSION = "1.0.0-tradingbackend";
 // Book/quote emit throttles (dxFeed Quote can tick many times/sec).
 const BOOK_THROTTLE_MS = 200;
-// A candle-history snapshot is "done" once no new bars arrive for this long.
-const HISTORY_IDLE_MS = 700;
-const HISTORY_MAX_MS = 8_000;
+// A candle-history snapshot is "done" once no new bars arrive for this long
+// AFTER the first bar. Do not arm the idle timer until then — cold snapshots
+// often take 1–3s before the first Candle event, and a pre-armed 700ms idle
+// was finishing empty (blank charts, volume stuck at 0).
+const HISTORY_IDLE_MS = 1_200;
+/** Overall cap per candle request. Keep short — if nothing arrives, fall back to live bars. */
+const HISTORY_MAX_MS = 3_500;
+/** Cap how far back we ask dxFeed for candles (large windows stall or empty-out). */
+const HISTORY_MAX_BARS = 2_500;
+const LIVE_BARS_FILE = path.join(process.cwd(), "data", "dxfeed-live-bars.json");
+const LIVE_BARS_SAVE_MS = 15_000;
 
 const CHANNEL_FEED = 1; // live Quote/Trade/Summary
 const CHANNEL_HIST = 3; // on-demand Candle snapshots
@@ -85,7 +95,7 @@ interface SymState {
 interface HistPending {
   bars: Map<number, Candle>; // time(sec) → bar, deduped
   resolve: (bars: Candle[]) => void;
-  idle: NodeJS.Timeout;
+  idle: NodeJS.Timeout | null;
   cap: NodeJS.Timeout;
   precision: number;
 }
@@ -108,6 +118,8 @@ export class DxFeedProvider extends BaseProvider {
   private readonly bookEmitAt = new Map<string, number>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
   private readonly hist = new Map<string, HistPending>();
+  /** null = unknown; false = this endpoint returns no Candle events (skip waiting). */
+  private candleEntitled: boolean | null = null;
   /* Live-built 1-minute bars per symbol, oldest first.
    *
    * Candle history is a SEPARATE dxFeed entitlement from streaming quotes, and an
@@ -117,6 +129,8 @@ export class DxFeedProvider extends BaseProvider {
    * already receiving gives a real chart that starts shallow and deepens as it runs.
    * Same approach DatabentoLiveProvider uses to bridge its publication lag. */
   private readonly liveBars = new Map<string, Candle[]>();
+  private liveBarsDirty = false;
+  private liveBarsSaveTimer: NodeJS.Timeout | null = null;
 
   /** Static fallback (public demo, or a pre-minted DXFEED_ENDPOINT/TOKEN pair). */
   private readonly staticEndpoint: string;
@@ -172,6 +186,7 @@ export class DxFeedProvider extends BaseProvider {
       const sample = [...this.toDx.entries()].map(([k, v]) => `${k}=${v}`).join(", ");
       console.log(`[dxfeed] symbol map: ${sample}`);
     }
+    this.loadLiveBars();
   }
 
   /** Register eventSymbol → internal root (supports many internals per dx symbol). */
@@ -217,14 +232,52 @@ export class DxFeedProvider extends BaseProvider {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     this.reconnectTimer = this.keepaliveTimer = null;
+    if (this.liveBarsSaveTimer) clearInterval(this.liveBarsSaveTimer);
+    this.liveBarsSaveTimer = null;
+    this.saveLiveBars();
     for (const p of this.hist.values()) {
-      clearTimeout(p.idle);
+      if (p.idle) clearTimeout(p.idle);
       clearTimeout(p.cap);
       p.resolve([]);
     }
     this.hist.clear();
     this.ws?.close();
     this.ws = null;
+  }
+
+  /** Restore 1m bars written on prior runs so charts aren't empty after restart. */
+  private loadLiveBars(): void {
+    try {
+      if (!existsSync(LIVE_BARS_FILE)) return;
+      const raw = JSON.parse(readFileSync(LIVE_BARS_FILE, "utf8")) as Record<string, Candle[]>;
+      const cutoff = Math.floor(Date.now() / 1000) - LIVE_BAR_CAP * 60;
+      let n = 0;
+      for (const [sym, bars] of Object.entries(raw)) {
+        if (!this.state.has(sym) || !Array.isArray(bars)) continue;
+        const kept = bars.filter((b) => b && b.time >= cutoff && b.close > 0).slice(-LIVE_BAR_CAP);
+        if (kept.length) {
+          this.liveBars.set(sym, kept);
+          n += kept.length;
+        }
+      }
+      if (n) console.log(`[dxfeed] restored ${n} live bars from disk`);
+    } catch (err) {
+      console.warn("[dxfeed] could not load live bars:", (err as Error).message);
+    }
+    this.liveBarsSaveTimer = setInterval(() => this.saveLiveBars(), LIVE_BARS_SAVE_MS);
+  }
+
+  private saveLiveBars(): void {
+    if (!this.liveBarsDirty) return;
+    try {
+      mkdirSync(path.dirname(LIVE_BARS_FILE), { recursive: true });
+      const out: Record<string, Candle[]> = {};
+      for (const [sym, bars] of this.liveBars) out[sym] = bars;
+      writeFileSync(LIVE_BARS_FILE, JSON.stringify(out));
+      this.liveBarsDirty = false;
+    } catch (err) {
+      console.warn("[dxfeed] could not save live bars:", (err as Error).message);
+    }
   }
 
   // --- connection --------------------------------------------------
@@ -455,6 +508,7 @@ export class DxFeedProvider extends BaseProvider {
       open.low = Math.min(open.low, price);
       open.close = price;
       open.volume = (open.volume ?? 0) + (Number.isFinite(size) ? size : 0);
+      this.liveBarsDirty = true;
       return;
     }
     // Out-of-order print for a minute we already closed: drop it rather than
@@ -462,6 +516,7 @@ export class DxFeedProvider extends BaseProvider {
     if (open && open.time > minute) return;
     bars.push({ time: minute, open: price, high: price, low: price, close: price, volume: Number.isFinite(size) ? size : 0 });
     if (bars.length > LIVE_BAR_CAP) bars.splice(0, bars.length - LIVE_BAR_CAP);
+    this.liveBarsDirty = true;
   }
 
   private onQuote(symbol: string, st: SymState, e: Record<string, unknown>): void {
@@ -512,6 +567,12 @@ export class DxFeedProvider extends BaseProvider {
     const ask = st.ask > 0 ? st.ask : st.price + spread;
     // Prefer prev-day close for the 24h change baseline; fall back to the day open.
     const base = st.prevClose > 0 ? st.prevClose : st.dayOpen;
+    // dayVolume only arrives on Trade events; when those are sparse, sum live 1m bars.
+    let volume24h = Math.round(st.volume);
+    if (volume24h <= 0) {
+      const bars = this.liveBars.get(symbol);
+      if (bars?.length) volume24h = Math.round(bars.reduce((s, b) => s + (b.volume ?? 0), 0));
+    }
     this.emit("quote", {
       symbol,
       price: round(st.price, p),
@@ -520,7 +581,7 @@ export class DxFeedProvider extends BaseProvider {
       change24h: base > 0 ? (st.price - base) / base : 0,
       high24h: round(st.high > 0 ? Math.max(st.high, st.price) : st.price, p),
       low24h: round(st.low > 0 ? Math.min(st.low, st.price) : st.price, p),
-      volume24h: Math.round(st.volume),
+      volume24h,
       lastSize,
       ts: Date.now(),
     });
@@ -543,10 +604,51 @@ export class DxFeedProvider extends BaseProvider {
     const inst = getInstrument(symbol);
     const dx = this.toDx.get(symbol);
     if (!inst || !dx) return [];
-    const snapshot = this.channelOpen.get(CHANNEL_HIST)
-      ? await this.candleSnapshot(dx, inst.pricePrecision, resolutionSec, count)
-      : [];
-    return this.mergeLiveBars(symbol, snapshot, resolutionSec, count);
+    const want = Math.min(Math.max(1, count), HISTORY_MAX_BARS);
+    let snapshot: Candle[] = [];
+    // Once we know this gateway has no Candle entitlement, don't block chart loads.
+    if (this.channelOpen.get(CHANNEL_HIST) && this.candleEntitled !== false) {
+      const continuous = CONTINUOUS_SYMBOL_MAP[symbol];
+      const candidates = continuous && continuous !== dx ? [dx, continuous] : [dx];
+      for (const sym of candidates) {
+        const bars = await this.candleSnapshot(sym, inst.pricePrecision, resolutionSec, want);
+        if (bars.length > snapshot.length) snapshot = bars;
+        if (snapshot.length > 0) break; // don't wait on a second symbol if the first worked
+      }
+      if (snapshot.length === 0) {
+        this.candleEntitled = false;
+        console.warn(`[dxfeed] candle snapshot empty for ${symbol} — live bars only (skipping further Candle waits)`);
+      } else {
+        this.candleEntitled = true;
+        console.log(`[dxfeed] candle snapshot ${symbol}: ${snapshot.length} bars`);
+      }
+    }
+    return this.mergeLiveBars(symbol, snapshot, resolutionSec, want);
+  }
+
+  /**
+   * When Candle entitlement is missing and the live buffer is still thin, pad
+   * flat session bars from day-open (or prev close) up to the first live print.
+   * Honest placeholders (volume 0) so the chart isn't a blank price line.
+   */
+  private sessionPadBars(symbol: string, resolutionSec: number, count: number): Candle[] {
+    if (resolutionSec < 60) return [];
+    const st = this.state.get(symbol);
+    const inst = getInstrument(symbol);
+    if (!st?.havePrice || !inst) return [];
+    const live = this.liveBars.get(symbol) ?? [];
+    if (live.length >= 120) return []; // already have ~2h of real ticks
+    const anchor = st.dayOpen || st.prevClose;
+    if (!(anchor > 0)) return [];
+    const firstLive = live[0]?.time;
+    const end = firstLive ?? Math.floor(Date.now() / 1000 / resolutionSec) * resolutionSec;
+    const start = end - Math.min(count, 480) * resolutionSec; // up to ~8h at 1m
+    const pad: Candle[] = [];
+    const px = round(anchor, inst.pricePrecision);
+    for (let t = start; t < end; t += resolutionSec) {
+      pad.push({ time: t, open: px, high: px, low: px, close: px, volume: 0 });
+    }
+    return pad;
   }
 
   /** Ask dxFeed for a Candle snapshot. Empty when the endpoint has no candle
@@ -562,11 +664,16 @@ export class DxFeedProvider extends BaseProvider {
         bars: new Map(),
         resolve,
         precision,
-        idle: setTimeout(() => this.finishHistory(candleSymbol), HISTORY_IDLE_MS),
+        // Idle timer is armed on the first bar in onCandle — not here.
+        idle: null as unknown as NodeJS.Timeout,
         cap: setTimeout(() => this.finishHistory(candleSymbol), HISTORY_MAX_MS),
       };
       this.hist.set(candleSymbol, pending);
-      this.send({ type: "FEED_SUBSCRIPTION", channel: CHANNEL_HIST, add: [{ type: "Candle", symbol: candleSymbol, fromTime }] });
+      this.send({
+        type: "FEED_SUBSCRIPTION",
+        channel: CHANNEL_HIST,
+        add: [{ type: "Candle", symbol: candleSymbol, fromTime }],
+      });
     });
   }
 
@@ -578,11 +685,14 @@ export class DxFeedProvider extends BaseProvider {
    *  snapshot always wins where the two overlap. */
   private mergeLiveBars(symbol: string, snapshot: Candle[], resolutionSec: number, count: number): Candle[] {
     const live = this.liveBars.get(symbol);
+    const pad = (!snapshot.length && resolutionSec >= 60) ? this.sessionPadBars(symbol, resolutionSec, count) : [];
     // The buffer is minute-grained, so it cannot build sub-minute resolutions.
-    if (resolutionSec < 60 || !live || live.length === 0) return snapshot.slice(-count);
+    if (resolutionSec < 60) return snapshot.slice(-count);
     const lastSnapshot = snapshot.length ? snapshot[snapshot.length - 1]!.time : 0;
-    const tail = aggregateCandles(live, resolutionSec).filter((c) => c.time > lastSnapshot);
-    return (tail.length ? [...snapshot, ...tail] : snapshot).slice(-count);
+    const liveAgg = live?.length ? aggregateCandles(live, resolutionSec).filter((c) => c.time > lastSnapshot) : [];
+    const padTail = pad.filter((c) => c.time > lastSnapshot && (!liveAgg.length || c.time < liveAgg[0]!.time));
+    const merged = [...snapshot, ...padTail, ...liveAgg];
+    return merged.slice(-count);
   }
 
   private onCandle(e: Record<string, unknown>): void {
@@ -595,6 +705,7 @@ export class DxFeedProvider extends BaseProvider {
     // to mark the end of the history snapshot — skip it so only real bars are returned.
     if (!timeSec || close <= 0) return;
     const p = pending.entry.precision;
+    const first = pending.entry.bars.size === 0;
     pending.entry.bars.set(timeSec, {
       time: timeSec,
       open: round(num(e.open), p),
@@ -603,9 +714,12 @@ export class DxFeedProvider extends BaseProvider {
       close: round(close, p),
       volume: Math.max(0, Math.round(num(e.volume))),
     });
-    // Reset the idle timer — snapshot is "complete" once bars stop flowing.
-    clearTimeout(pending.entry.idle);
+    // Arm / reset idle only after bars are flowing.
+    if (pending.entry.idle) clearTimeout(pending.entry.idle);
     pending.entry.idle = setTimeout(() => this.finishHistory(pending.key), HISTORY_IDLE_MS);
+    if (first) {
+      console.log(`[dxfeed] first candle ${pending.key} @ ${close}`);
+    }
   }
 
   /** Match candle events even when dxFeed rewrites continuous → dated in eventSymbol. */
@@ -633,7 +747,7 @@ export class DxFeedProvider extends BaseProvider {
   private finishHistory(candleSymbol: string): void {
     const pending = this.hist.get(candleSymbol);
     if (!pending) return;
-    clearTimeout(pending.idle);
+    if (pending.idle) clearTimeout(pending.idle);
     clearTimeout(pending.cap);
     this.hist.delete(candleSymbol);
     // Stop the snapshot subscription so it doesn't keep streaming live candles.

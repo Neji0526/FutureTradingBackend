@@ -118,61 +118,14 @@ export async function runSeed(): Promise<void> {
       [accountId, ["ES", "MES", "NQ", "MNQ", "YM", "MYM", "CL", "MCL", "GC", "MGC"]],
     );
 
-    // Demo positions + orders so the trade page shows DB-backed data
-    // (until the order engine writes these itself). Reset, then insert.
+    // Clear any leftover demo book — do NOT insert fake open positions/orders.
+    // Traders start flat; the order engine writes real positions from fills.
     await pool.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
     await pool.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1`, [accountId]);
     await pool.query(`DELETE FROM "Order" WHERE "accountId" = $1`, [accountId]);
 
-    // Price the demo positions near the LIVE mark (fetched above) so each one's
-    // dollar P&L (× contract multiplier) is small and bounded — a mix of green/red
-    // that keeps the account comfortably ACTIVE. Offsets are in price points.
-    //
-    // DRIFT-PROOFING: seed MICRO contracts (MES/MNQ/MCL/MGC, 1/10th the point value
-    // of their E-mini parents) rather than full-size. The open book still marks live
-    // off the parent's quote (micros trade at the same price level), but the dollar
-    // swing is ~10× smaller — so an unattended demo account can't drift through the
-    // $3,000 max-drawdown limit over hours of live market movement. `base` is the
-    // symbol we pull the live mark from (micros aren't separately quoted server-side).
     const marks = await fetchLiveMarks(MARK_SYMBOLS);
     const markOf = (s: string) => marks[s] ?? getInstrument(s)!.simBase;
-    const positions = [
-      { symbol: "MES", base: "ES", side: "LONG", qty: 1, avg: roundTo("MES", markOf("ES") - 8) }, // MES $5/pt → ~+$40
-      { symbol: "MNQ", base: "NQ", side: "SHORT", qty: 1, avg: roundTo("MNQ", markOf("NQ") + 25) }, // MNQ $2/pt → ~+$50
-      { symbol: "MCL", base: "CL", side: "LONG", qty: 1, avg: roundTo("MCL", markOf("CL") + 0.2) }, // MCL $100/pt → ~-$20 (red)
-      { symbol: "MGC", base: "GC", side: "LONG", qty: 1, avg: roundTo("MGC", markOf("GC") - 4) }, // MGC $10/pt → ~+$40
-    ];
-    for (const p of positions) {
-      await pool.query(
-        `INSERT INTO "Position" ("accountId","symbol","side","quantity","averagePrice","realizedPnl")
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [accountId, p.symbol, p.side, p.qty, p.avg, 0],
-      );
-      // Mirror as a single open lot so the admin per-trade Positions view shows it too.
-      await pool.query(
-        `INSERT INTO "PositionLot" ("accountId","symbol","side","quantity","entryPrice")
-         VALUES ($1,$2,$3,$4,$5)`,
-        [accountId, p.symbol, p.side, p.qty, p.avg],
-      );
-    }
-
-    // Working orders priced clear of the live mark so the resting-order monitor
-    // does NOT immediately trigger them (buy-limit below, sell-limit above,
-    // sell-stop below). The MGC market order is historical (it opened the MGC pos).
-    // Micro symbols match the seeded positions; priced off the parent's live mark.
-    const orders = [
-      { symbol: "MES", side: "BUY", type: "LIMIT", status: "PENDING", qty: 1, filled: 0, req: roundTo("MES", markOf("ES") - 60), fill: null },
-      { symbol: "MNQ", side: "SELL", type: "LIMIT", status: "PENDING", qty: 1, filled: 0, req: roundTo("MNQ", markOf("NQ") + 120), fill: null },
-      { symbol: "MGC", side: "BUY", type: "MARKET", status: "FILLED", qty: 1, filled: 1, req: null, fill: roundTo("MGC", markOf("GC") - 4) },
-      { symbol: "MCL", side: "SELL", type: "STOP", status: "PENDING", qty: 1, filled: 0, req: roundTo("MCL", markOf("CL") - 3), fill: null },
-    ];
-    for (const o of orders) {
-      await pool.query(
-        `INSERT INTO "Order" ("accountId","symbol","side","type","status","quantity","filledQuantity","requestedPrice","fillPrice")
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [accountId, o.symbol, o.side, o.type, o.status, o.qty, o.filled, o.req, o.fill],
-      );
-    }
 
     // A few CLOSED positions (round-trip trades) so the admin Positions view has
     // history. Realized P&L = (exit−entry) for longs / (entry−exit) for shorts,
