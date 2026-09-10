@@ -30,6 +30,8 @@ const MAX_BACKOFF_MS = 15_000;
 const PROTOCOL_VERSION = "1.0.0-tradingbackend";
 // Book/quote emit throttles (dxFeed Quote can tick many times/sec).
 const BOOK_THROTTLE_MS = 200;
+/** Emit at most this often per symbol, but always flush on a tick-sized price move. */
+const QUOTE_EMIT_MIN_MS = 100;
 // A candle-history snapshot is "done" once no new bars arrive for this long
 // AFTER the first bar. Do not arm the idle timer until then — cold snapshots
 // often take 1–3s before the first Candle event, and a pre-armed 700ms idle
@@ -42,7 +44,7 @@ const HISTORY_MAX_BARS = 2_500;
 /** After an empty Candle snapshot, retry this root no sooner than this (ms). */
 const CANDLE_MISS_BACKOFF_MS = 45_000;
 const LIVE_BARS_FILE = path.join(process.cwd(), "data", "dxfeed-live-bars.json");
-const LIVE_BARS_SAVE_MS = 15_000;
+const LIVE_BARS_SAVE_MS = 5_000;
 
 const CHANNEL_FEED = 1; // live Quote/Trade/Summary
 const CHANNEL_HIST = 3; // on-demand Candle snapshots
@@ -130,6 +132,8 @@ export class DxFeedProvider extends BaseProvider {
   private readonly fromDx = new Map<string, string[]>();
   private readonly channelOpen = new Map<number, boolean>();
   private readonly bookEmitAt = new Map<string, number>();
+  private readonly quoteEmitAt = new Map<string, number>();
+  private readonly lastEmittedPrice = new Map<string, number>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
   private readonly hist = new Map<string, HistPending>();
   /**
@@ -152,6 +156,7 @@ export class DxFeedProvider extends BaseProvider {
   private readonly liveBars = new Map<string, Candle[]>();
   private liveBarsDirty = false;
   private liveBarsSaveTimer: NodeJS.Timeout | null = null;
+  private liveBarsSaveSoon: NodeJS.Timeout | null = null;
 
   /** Static fallback (public demo, or a pre-minted DXFEED_ENDPOINT/TOKEN pair). */
   private readonly staticEndpoint: string;
@@ -314,11 +319,19 @@ export class DxFeedProvider extends BaseProvider {
   private saveLiveBars(): void {
     if (!this.liveBarsDirty) return;
     try {
-      mkdirSync(path.dirname(LIVE_BARS_FILE), { recursive: true });
+      const dir = path.dirname(LIVE_BARS_FILE);
+      mkdirSync(dir, { recursive: true });
       const out: Record<string, Candle[]> = {};
-      for (const [sym, bars] of this.liveBars) out[sym] = bars;
+      let n = 0;
+      for (const [sym, bars] of this.liveBars) {
+        if (bars.length) {
+          out[sym] = bars;
+          n += bars.length;
+        }
+      }
       writeFileSync(LIVE_BARS_FILE, JSON.stringify(out));
       this.liveBarsDirty = false;
+      if (n > 0) console.log(`[dxfeed] saved ${n} live bars → ${LIVE_BARS_FILE}`);
     } catch (err) {
       console.warn("[dxfeed] could not save live bars:", (err as Error).message);
     }
@@ -554,7 +567,7 @@ export class DxFeedProvider extends BaseProvider {
     this.emitQuote(symbol, st, num(e.size));
   }
 
-  /** Fold one trade print into the current minute's bar for `symbol`. */
+  /** Fold one trade/quote print into the current minute's bar for `symbol`. */
   private recordLiveBar(symbol: string, price: number, size: number): void {
     const minute = Math.floor(Date.now() / 60_000) * 60; // bar time, seconds
     let bars = this.liveBars.get(symbol);
@@ -566,6 +579,7 @@ export class DxFeedProvider extends BaseProvider {
       open.close = price;
       open.volume = (open.volume ?? 0) + (Number.isFinite(size) ? size : 0);
       this.liveBarsDirty = true;
+      this.scheduleLiveBarsSave();
       return;
     }
     // Out-of-order print for a minute we already closed: drop it rather than
@@ -574,6 +588,15 @@ export class DxFeedProvider extends BaseProvider {
     bars.push({ time: minute, open: price, high: price, low: price, close: price, volume: Number.isFinite(size) ? size : 0 });
     if (bars.length > LIVE_BAR_CAP) bars.splice(0, bars.length - LIVE_BAR_CAP);
     this.liveBarsDirty = true;
+    this.scheduleLiveBarsSave();
+  }
+
+  private scheduleLiveBarsSave(): void {
+    if (this.liveBarsSaveSoon) return;
+    this.liveBarsSaveSoon = setTimeout(() => {
+      this.liveBarsSaveSoon = null;
+      this.saveLiveBars();
+    }, 2_000);
   }
 
   private onQuote(symbol: string, st: SymState, e: Record<string, unknown>): void {
@@ -619,9 +642,21 @@ export class DxFeedProvider extends BaseProvider {
   private emitQuote(symbol: string, st: SymState, lastSize: number): void {
     const inst = getInstrument(symbol)!;
     const p = inst.pricePrecision;
-    const spread = inst.tickSize;
+    const tick = inst.tickSize;
+    const spread = tick;
     const bid = st.bid > 0 ? st.bid : st.price - spread;
     const ask = st.ask > 0 ? st.ask : st.price + spread;
+    // Snap to the instrument tick so charts/headers move on real ticks (YM=1, ES=0.25).
+    const price = Math.round(st.price / tick) * tick;
+    const prev = this.lastEmittedPrice.get(symbol);
+    const now = Date.now();
+    const elapsed = now - (this.quoteEmitAt.get(symbol) ?? 0);
+    const moved = prev == null || Math.abs(price - prev) >= tick * 0.5;
+    // Throttle quiet repeats, but never drop a tick-sized move — that is what made
+    // NQ/YM/GC charts look frozen next to busy ES trade prints.
+    if (!moved && elapsed < QUOTE_EMIT_MIN_MS) return;
+    this.quoteEmitAt.set(symbol, now);
+    this.lastEmittedPrice.set(symbol, price);
     // Prefer prev-day close for the 24h change baseline; fall back to the day open.
     const base = st.prevClose > 0 ? st.prevClose : st.dayOpen;
     // dayVolume only arrives on Trade events; when those are sparse, sum live 1m bars.
@@ -632,17 +667,17 @@ export class DxFeedProvider extends BaseProvider {
     }
     this.emit("quote", {
       symbol,
-      price: round(st.price, p),
+      price: round(price, p),
       bid: round(bid, p),
       ask: round(ask, p),
-      change24h: base > 0 ? (st.price - base) / base : 0,
-      high24h: round(st.high > 0 ? Math.max(st.high, st.price) : st.price, p),
-      low24h: round(st.low > 0 ? Math.min(st.low, st.price) : st.price, p),
+      change24h: base > 0 ? (price - base) / base : 0,
+      high24h: round(st.high > 0 ? Math.max(st.high, price) : price, p),
+      low24h: round(st.low > 0 ? Math.min(st.low, price) : price, p),
       volume24h,
       lastSize,
-      ts: Date.now(),
+      ts: now,
     });
-    this.maybeEmitBook(symbol, st, inst.tickSize, p);
+    this.maybeEmitBook(symbol, st, tick, p);
   }
 
   /** dxFeed's Order/depth feed isn't wired yet — emit a synthetic ladder (like the
