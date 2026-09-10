@@ -2,9 +2,12 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createEvaluationAccount } from "../trading/repository.js";
 import { useDatabase } from "../config.js";
 import type { AuthService } from "../auth/service.js";
+import { clientIp, normalizeIp } from "../auth/client-ip.js";
+import type { UserStore } from "../auth/users.js";
 import { getPurchaseStore } from "./store.js";
 import { extractPurchaseFields } from "./extract.js";
 import { getOnboardingProfileStore } from "./onboarding-profile.js";
+import { adminDeactivateSubscription } from "../trading/admin-repository.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ORDER_RE = /^[A-Za-z0-9_-]{4,64}$/;
@@ -69,10 +72,14 @@ export async function handleClickFunnelsWebhook(
     return;
   }
 
+  // Prefer buyer IP from the CF payload; fall back to the relayed client IP header.
+  const subscribeIp = normalizeIp(fields.ip ?? clientIp(req) ?? undefined) ?? null;
+
   const purchase = await getPurchaseStore().record({
     orderNumber: fields.orderNumber,
     email: fields.email,
     productName: fields.productName,
+    ip: subscribeIp,
     rawPayload: payload,
   });
 
@@ -82,6 +89,7 @@ export async function handleClickFunnelsWebhook(
       orderNumber: purchase.orderNumber,
       email: purchase.email,
       status: purchase.status,
+      ip: purchase.ip,
     },
   });
 }
@@ -124,10 +132,12 @@ export async function handleOnboardingComplete(
   req: IncomingMessage,
   res: ServerResponse,
   auth: AuthService,
+  users: UserStore,
   json: JsonFn,
   readJson: ReadJsonFn,
 ): Promise<void> {
   const body = (await readJson<OnboardingCompleteBody>(req)) ?? {};
+  const onboardingIp = normalizeIp(clientIp(req) ?? undefined) ?? null;
 
   const orderNumber = body.orderNumber?.trim() ?? "";
   const email = body.email?.trim().toLowerCase() ?? "";
@@ -202,10 +212,16 @@ export async function handleOnboardingComplete(
     return json(res, 500, { error: "Could not save onboarding profile." });
   }
 
-  const redeemed = await store.redeem(orderNumber, email, userId);
+  // Prefer the real browser IP from onboarding; keep webhook IP if client IP is missing.
+  const bindIp = onboardingIp ?? purchase.ip;
+  const redeemed = await store.redeem(orderNumber, email, userId, bindIp);
   if (!redeemed) {
     // Extremely rare race: order burned between check and redeem.
     return json(res, 409, { error: "This purchase has already been used." });
+  }
+
+  if (bindIp) {
+    await users.setBoundIp(userId, bindIp);
   }
 
   if (useDatabase) {
@@ -221,6 +237,29 @@ export async function handleOnboardingComplete(
     orderNumber: redeemed.orderNumber,
     email: redeemed.email,
   });
+}
+
+/**
+ * Admin: deactivate a trader's subscription — delete purchase rows, suspend the
+ * user + account, and clear IP/session locks so login is blocked.
+ */
+export async function handleDeactivateSubscription(
+  userId: string,
+  users: UserStore,
+): Promise<{ ok: boolean; purchasesRemoved: number; error?: string }> {
+  if (!userId) return { ok: false, purchasesRemoved: 0, error: "user id required" };
+
+  if (useDatabase) {
+    const result = await adminDeactivateSubscription(userId);
+    if (!result.ok) return { ok: false, purchasesRemoved: 0, error: "trader not found" };
+    return { ok: true, purchasesRemoved: result.purchasesRemoved };
+  }
+
+  // Memory / mock path.
+  const removed = await getPurchaseStore().deleteByUserId(userId);
+  const ok = await users.deactivateUser(userId);
+  if (!ok) return { ok: false, purchasesRemoved: removed, error: "trader not found" };
+  return { ok: true, purchasesRemoved: removed };
 }
 
 function asBool(v: unknown): boolean {

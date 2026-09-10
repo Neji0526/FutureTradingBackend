@@ -6,11 +6,12 @@ export function extractPurchaseFields(payload: unknown): {
   orderNumber: string | null;
   email: string | null;
   productName: string | null;
+  ip: string | null;
 } {
   const root = asRecord(payload);
   // Our Next relay wraps as { source, receivedAt, data }.
   const data = asRecord(root?.data) ?? root;
-  if (!data) return { orderNumber: null, email: null, productName: null };
+  if (!data) return { orderNumber: null, email: null, productName: null, ip: null };
 
   const contact = asRecord(data.contact) ?? asRecord(data.Contact) ?? asRecord(data.buyer);
   const order =
@@ -54,10 +55,30 @@ export function extractPurchaseFields(payload: unknown): {
     asRecord(data.products)?.name,
   ]);
 
+  const ip = firstString([
+    data.ip,
+    data.ip_address,
+    data.ipAddress,
+    data.client_ip,
+    data.clientIp,
+    data.buyer_ip,
+    data.buyerIp,
+    contact?.ip,
+    contact?.ip_address,
+    contact?.ipAddress,
+    contact?.last_ip,
+    order?.ip,
+    order?.ip_address,
+    // Next relay may forward the original client IP explicitly.
+    root?.clientIp,
+    root?.client_ip,
+  ]);
+
   return {
     orderNumber: orderNumber ? String(orderNumber).trim() : null,
     email: email ? String(email).trim().toLowerCase() : null,
     productName: productName ? String(productName).trim() : null,
+    ip: ip ? String(ip).trim() : null,
   };
 }
 

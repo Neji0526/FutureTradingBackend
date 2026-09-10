@@ -10,9 +10,12 @@ interface UserRow {
   name: string | null;
   role: Role;
   status: User["status"];
+  boundIp: string | null;
+  activeSessionIp: string | null;
+  sessionVersion: number | string;
 }
 
-const COLS = `"id","email","passwordHash","name","role","status"`;
+const COLS = `"id","email","passwordHash","name","role","status","boundIp","activeSessionIp","sessionVersion"`;
 
 /** PostgreSQL-backed user store (pure-JS `pg`). Reads/writes the "User" table. */
 export class PgUserStore implements UserStore {
@@ -53,6 +56,54 @@ export class PgUserStore implements UserStore {
     return (res.rowCount ?? 0) > 0;
   }
 
+  async setBoundIp(id: string, ip: string | null): Promise<boolean> {
+    const res = await getPool().query(
+      `UPDATE "User" SET "boundIp" = $2, "updatedAt" = now() WHERE "id" = $1`,
+      [id, ip],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async openSession(id: string, ip: string): Promise<number | null> {
+    const { rows } = await getPool().query<{ sessionVersion: number | string }>(
+      `UPDATE "User"
+       SET "activeSessionIp" = $2,
+           "sessionVersion" = COALESCE("sessionVersion", 0) + 1,
+           "updatedAt" = now()
+       WHERE "id" = $1
+       RETURNING "sessionVersion"`,
+      [id, ip],
+    );
+    if (!rows[0]) return null;
+    return Number(rows[0].sessionVersion);
+  }
+
+  async clearSession(id: string): Promise<boolean> {
+    const res = await getPool().query(
+      `UPDATE "User"
+       SET "activeSessionIp" = NULL,
+           "sessionVersion" = COALESCE("sessionVersion", 0) + 1,
+           "updatedAt" = now()
+       WHERE "id" = $1`,
+      [id],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async deactivateUser(id: string): Promise<boolean> {
+    const res = await getPool().query(
+      `UPDATE "User"
+       SET "status" = 'SUSPENDED',
+           "boundIp" = NULL,
+           "activeSessionIp" = NULL,
+           "sessionVersion" = COALESCE("sessionVersion", 0) + 1,
+           "updatedAt" = now()
+       WHERE "id" = $1 AND "role" = 'TRADER'`,
+      [id],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
   private map(r: UserRow): User {
     return {
       id: r.id,
@@ -61,6 +112,9 @@ export class PgUserStore implements UserStore {
       name: r.name ?? "",
       role: r.role,
       status: r.status,
+      boundIp: r.boundIp ?? null,
+      activeSessionIp: r.activeSessionIp ?? null,
+      sessionVersion: Number(r.sessionVersion ?? 0),
     };
   }
 }

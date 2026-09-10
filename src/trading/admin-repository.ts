@@ -575,6 +575,59 @@ export async function adminGetTraderDetail(userId: string): Promise<AdminTraderD
 
 // --------------------------- mutations ---------------------------
 
+/**
+ * Cancel a trader's subscription: delete Purchase rows, suspend user + account,
+ * and clear bound/session IP so login is blocked.
+ */
+export async function adminDeactivateSubscription(
+  userId: string,
+): Promise<{ ok: boolean; purchasesRemoved: number }> {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const u = await client.query(
+      `UPDATE "User"
+       SET "status" = 'SUSPENDED',
+           "boundIp" = NULL,
+           "activeSessionIp" = NULL,
+           "sessionVersion" = COALESCE("sessionVersion", 0) + 1,
+           "updatedAt" = now()
+       WHERE "id" = $1 AND "role" = 'TRADER'
+       RETURNING "id"`,
+      [userId],
+    );
+    if (u.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, purchasesRemoved: 0 };
+    }
+
+    const del = await client.query(`DELETE FROM "Purchase" WHERE "userId" = $1`, [userId]);
+    const purchasesRemoved = del.rowCount ?? 0;
+
+    const acc = await client.query<{ id: string }>(`SELECT "id" FROM "Account" WHERE "userId" = $1`, [userId]);
+    const accountId = acc.rows[0]?.id;
+    if (accountId) {
+      await client.query(`UPDATE "Account" SET "status" = 'SUSPENDED', "updatedAt" = now() WHERE "id" = $1`, [
+        accountId,
+      ]);
+      await logActivity(
+        client,
+        accountId,
+        "ACCOUNT_SUSPENSION",
+        "Subscription deactivated — purchase removed, login blocked",
+      );
+    }
+
+    await client.query("COMMIT");
+    return { ok: true, purchasesRemoved };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /** Suspend/activate a trader (User) and cascade to their account. Logs on suspend. */
 export async function adminSetTraderStatus(userId: string, action: AdminAction): Promise<boolean> {
   const client = await getPool().connect();

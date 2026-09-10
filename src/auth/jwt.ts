@@ -7,6 +7,8 @@ export interface JwtPayload {
   sub: string; // user id
   email: string;
   role: Role;
+  /** Session version — must match User.sessionVersion or the token is stale. */
+  sv?: number;
 }
 
 /** Sign a short-lived access token. */
@@ -19,9 +21,9 @@ export function verifyToken(token: string): JwtPayload | null {
   try {
     const decoded = jwt.verify(token, config.jwt.secret);
     if (typeof decoded === "string") return null;
-    const { sub, email, role } = decoded as jwt.JwtPayload & JwtPayload;
+    const { sub, email, role, sv } = decoded as jwt.JwtPayload & JwtPayload;
     if (!sub || !email || !role) return null;
-    return { sub, email, role };
+    return { sub, email, role, sv: typeof sv === "number" ? sv : Number(sv ?? 0) };
   } catch {
     return null;
   }

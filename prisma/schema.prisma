@@ -91,14 +91,20 @@ enum PurchaseStatus {
 // ----------------------------- Models -----------------------------
 
 model User {
-  id           String     @id @default(cuid())
-  email        String     @unique
-  passwordHash String
-  name         String?
-  role         Role       @default(TRADER)
-  status       UserStatus @default(ACTIVE)
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  id              String     @id @default(cuid())
+  email           String     @unique
+  passwordHash    String
+  name            String?
+  role            Role       @default(TRADER)
+  status          UserStatus @default(ACTIVE)
+  /** IP recorded at subscribe / onboarding — login must match. */
+  boundIp         String?
+  /** Set while a session is active; second login is rejected until logout. */
+  activeSessionIp String?
+  /** Bumped on login/logout/deactivate so old JWTs stop working. */
+  sessionVersion  Int        @default(0)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
 
   account            Account?
   purchases          Purchase[]
@@ -140,6 +146,8 @@ model Purchase {
   status      PurchaseStatus @default(PAID)
   productName String?
   rawPayload  Json?
+  /** Buyer IP at subscribe time (payload and/or client). */
+  ip          String?
   userId      String?
   user        User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
   createdAt   DateTime       @default(now())
@@ -148,6 +156,7 @@ model Purchase {
 
   @@index([email])
   @@index([status])
+  @@index([userId])
 }
 
 model Account {

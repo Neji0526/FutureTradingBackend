@@ -4,6 +4,8 @@ import type { MarketHub } from "../core/hub.js";
 import { INSTRUMENTS, SYMBOLS, getMultiplier } from "../instruments.js";
 import type { AuthService } from "../auth/service.js";
 import { bearerToken, verifyToken } from "../auth/jwt.js";
+import { clientIp } from "../auth/client-ip.js";
+import type { UserStore } from "../auth/users.js";
 import { config, useDatabase } from "../config.js";
 import {
   byoConfigured,
@@ -56,6 +58,7 @@ import { recomputeAllPhases } from "../trading/trader-stats.js";
 import type { MarketDataProvider } from "../providers/provider.js";
 import {
   handleClickFunnelsWebhook,
+  handleDeactivateSubscription,
   handleOnboardingComplete,
   handlePurchaseValidate,
 } from "../purchases/handlers.js";
@@ -67,6 +70,7 @@ interface ServerOptions {
   corsOrigin: string;
   providerName: string;
   auth: AuthService;
+  users: UserStore;
   accountStream: AccountStream;
   orderEngine: OrderEngine;
   /** Provider that serves candles via the OPERATOR (house) key — used by the signal
@@ -174,6 +178,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/auth/login" && req.method === "POST") {
     return handleLogin(req, res, opts.auth);
   }
+  if (url.pathname === "/api/auth/logout" && req.method === "POST") {
+    return handleLogout(req, res, opts.auth);
+  }
   if (url.pathname === "/api/auth/register" && req.method === "POST") {
     return handleRegister(req, res, opts.auth);
   }
@@ -193,7 +200,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
     return handlePurchaseValidate(orderNumber, res, json);
   }
   if (url.pathname === "/api/onboarding/complete" && req.method === "POST") {
-    return handleOnboardingComplete(req, res, opts.auth, json, readJson);
+    return handleOnboardingComplete(req, res, opts.auth, opts.users, json, readJson);
   }
 
   // --- Market-data connection (Model B / byo: each user's own Databento key) ---
@@ -279,6 +286,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
     return handleAdminRuleTemplateUpdate(url, req, res);
   if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return handleAdminStatus(url, req, res, opts.accountStream, "trader");
+  if (/^\/api\/admin\/traders\/[^/]+\/deactivate-subscription$/.test(url.pathname) && req.method === "POST")
+    return handleAdminDeactivateSubscription(url, req, res, opts.users, opts.accountStream);
   if (/^\/api\/admin\/traders\/[^/]+\/password$/.test(url.pathname) && req.method === "POST")
     return handleAdminResetPassword(url, req, res, opts.auth);
   if (/^\/api\/admin\/accounts\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
@@ -417,14 +426,36 @@ function handleMarketMarks(url: URL, req: IncomingMessage, res: ServerResponse, 
 async function handleLogin(req: IncomingMessage, res: ServerResponse, auth: AuthService) {
   const body = await readJson<{ email?: string; password?: string }>(req);
   if (!body?.email || !body?.password) return json(res, 400, { error: "email and password required" });
-  const result = await auth.login(body.email, body.password);
-  if (!result) return json(res, 401, { error: "Invalid email or password." });
+  const ip = clientIp(req);
+  const outcome = await auth.login(body.email, body.password, ip);
+  if (!outcome.ok) {
+    if (outcome.reason === "session_active") {
+      return json(res, 403, {
+        error: "This account is already signed in. Sign out from the other session first.",
+        code: "session_active",
+      });
+    }
+    if (outcome.reason === "ip_mismatch") {
+      return json(res, 403, {
+        error: "Login is only allowed from the IP address used at subscription.",
+        code: "ip_mismatch",
+      });
+    }
+    if (outcome.reason === "no_subscription" || outcome.reason === "suspended") {
+      return json(res, 403, {
+        error: "Subscription is inactive. Please purchase a new subscription.",
+        code: outcome.reason,
+      });
+    }
+    return json(res, 401, { error: "Invalid email or password." });
+  }
+  const result = outcome.result;
   // Audit the login (best-effort; never blocks auth).
   if (useDatabase) {
     void (async () => {
       try {
         const accountId = await getAccountIdByUserId(result.user.id);
-        if (accountId) await logActivity(getPool(), accountId, "USER_LOGIN", "Signed in", clientIp(req));
+        if (accountId) await logActivity(getPool(), accountId, "USER_LOGIN", "Signed in", ip);
       } catch {
         /* ignore audit failures */
       }
@@ -433,11 +464,26 @@ async function handleLogin(req: IncomingMessage, res: ServerResponse, auth: Auth
   json(res, 200, result);
 }
 
-/** Best-effort client IP for audit logs. */
-function clientIp(req: IncomingMessage): string | undefined {
-  const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd) return fwd.split(",")[0]!.trim();
-  return req.socket.remoteAddress ?? undefined;
+async function handleLogout(req: IncomingMessage, res: ServerResponse, auth: AuthService) {
+  const token = bearerToken(req.headers.authorization);
+  if (!token) return json(res, 401, { error: "Not authenticated." });
+  await auth.logout(token);
+  json(res, 200, { ok: true });
+}
+
+async function handleAdminDeactivateSubscription(
+  url: URL,
+  req: IncomingMessage,
+  res: ServerResponse,
+  users: UserStore,
+  accountStream: AccountStream,
+) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const userId = url.pathname.split("/")[4]!; // /api/admin/traders/:id/deactivate-subscription
+  const result = await handleDeactivateSubscription(userId, users);
+  if (!result.ok) return json(res, 404, { ok: false, error: result.error ?? "trader not found" });
+  accountStream.publishAdminUpdate({ kind: "trader_suspended", id: userId });
+  json(res, 200, { ok: true, purchasesRemoved: result.purchasesRemoved });
 }
 
 /** True only for a valid ADMIN-role bearer token. */

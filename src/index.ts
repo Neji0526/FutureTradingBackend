@@ -67,7 +67,8 @@ function buildProvider(): MarketDataProvider {
 }
 
 // Auth. Postgres-backed (PgUserStore) when DATABASE_URL is set, else in-memory.
-const auth = new AuthService(createUserStore());
+const users = createUserStore();
+const auth = new AuthService(users);
 
 // Provision an admin from ADMIN_EMAIL/ADMIN_PASSWORD if set (no seed/CLI needed).
 if (useDatabase) {
@@ -149,6 +150,7 @@ const server = createMarketServer(hub, {
   corsOrigin: config.corsOrigin,
   providerName: provider.name,
   auth,
+  users,
   accountStream,
   orderEngine,
   // Candles for the signal app's chart come from the operator key: the house feed
