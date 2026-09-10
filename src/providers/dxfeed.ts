@@ -75,6 +75,18 @@ const DEMO_SYMBOL_MAP: Record<string, string> = {
   CL: "USO", MCL: "USO", GC: "GLD", MGC: "GLD",
 };
 
+/**
+ * Micros trade the same price level as their mini — piggyback onto the parent's
+ * dxFeed symbol (the proven ES→MES pattern). If the micro contract is silent on
+ * the feed, it still gets live chart/quote data from the parent.
+ */
+const PARENT_OF: Record<string, string> = {
+  MES: "ES", MNQ: "NQ", MYM: "YM", MCL: "CL", MGC: "GC",
+};
+const MICRO_OF: Record<string, string> = {
+  ES: "MES", NQ: "MNQ", YM: "MYM", CL: "MCL", GC: "MGC",
+};
+
 /** Month codes used when stripping a dated CME root from an eventSymbol. */
 const MONTH_CODE_RE = /[FGHJKMNQUVXZ]\d{1,2}$/;
 
@@ -169,13 +181,24 @@ export class DxFeedProvider extends BaseProvider {
     }
     const base = isDemo ? DEMO_SYMBOL_MAP : buildDatedSymbolMap();
     for (const inst of INSTRUMENTS) {
-      const dx = override[inst.symbol] ?? base[inst.symbol];
+      // Micros share the parent's feed symbol (ES/MES pattern) unless overridden.
+      const parent = PARENT_OF[inst.symbol];
+      const feedRoot = parent ?? inst.symbol;
+      const dx = override[inst.symbol] ?? override[feedRoot] ?? base[feedRoot] ?? base[inst.symbol];
       if (!dx) continue;
       this.toDx.set(inst.symbol, dx);
       this.linkDxAlias(dx, inst.symbol);
+      // Parent events should also update the micro (and vice versa when same dx).
+      if (parent) this.linkDxAlias(dx, parent);
+      const micro = MICRO_OF[inst.symbol];
+      if (micro) this.linkDxAlias(dx, micro);
       // Also accept continuous-form events (/NQ:XCME) even when subscribed dated.
-      const continuous = CONTINUOUS_SYMBOL_MAP[inst.symbol];
-      if (continuous && continuous !== dx) this.linkDxAlias(continuous, inst.symbol);
+      const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[inst.symbol];
+      if (continuous && continuous !== dx) {
+        this.linkDxAlias(continuous, inst.symbol);
+        if (parent) this.linkDxAlias(continuous, parent);
+        if (micro) this.linkDxAlias(continuous, micro);
+      }
       this.state.set(inst.symbol, {
         price: inst.simBase, bid: 0, ask: 0, dayOpen: 0, prevClose: 0,
         high: 0, low: 0, volume: 0, havePrice: false, haveTrade: false,
@@ -184,7 +207,7 @@ export class DxFeedProvider extends BaseProvider {
     if (isDemo) console.log("[dxfeed] DEMO symbol map active (equity/FX stand-ins for futures)");
     else {
       const sample = [...this.toDx.entries()].map(([k, v]) => `${k}=${v}`).join(", ");
-      console.log(`[dxfeed] symbol map: ${sample}`);
+      console.log(`[dxfeed] symbol map (micros piggyback parents): ${sample}`);
     }
     this.loadLiveBars();
   }
@@ -202,21 +225,33 @@ export class DxFeedProvider extends BaseProvider {
   /**
    * Resolve FEED_DATA eventSymbol → internal roots.
    * Exact match first, then strip candle period, then dated → root fuzzy match
-   * so /NQU26:XCME still updates NQ when we subscribed /NQ:XCME (or vice versa).
+   * so /NQU26:XCME still updates NQ (and MNQ via piggyback) when subscribed dated.
    */
   private resolveEventSymbols(eventSymbol: string): string[] | undefined {
+    const expand = (roots: string[]): string[] => {
+      const out: string[] = [];
+      for (const r of roots) {
+        if (this.state.has(r) && !out.includes(r)) out.push(r);
+        const micro = MICRO_OF[r];
+        if (micro && this.state.has(micro) && !out.includes(micro)) out.push(micro);
+        const parent = PARENT_OF[r];
+        if (parent && this.state.has(parent) && !out.includes(parent)) out.push(parent);
+      }
+      return out;
+    };
+
     const exact = this.fromDx.get(eventSymbol);
-    if (exact) return exact;
+    if (exact) return expand(exact);
 
     const base = eventSymbol.replace(/\{=[^}]*\}$/, "");
     const exactBase = this.fromDx.get(base);
-    if (exactBase) return exactBase;
+    if (exactBase) return expand(exactBase);
 
-    // /NQU26:XCME or NQU26 → root NQ
+    // /NQU26:XCME or NQU26 → root NQ (+ MNQ)
     const bare = base.startsWith("/") ? base.slice(1) : base;
     const product = bare.split(":")[0] ?? bare;
     const root = product.replace(MONTH_CODE_RE, "");
-    if (root && this.state.has(root)) return [root];
+    if (root && this.state.has(root)) return expand([root]);
 
     return undefined;
   }
@@ -424,12 +459,25 @@ export class DxFeedProvider extends BaseProvider {
           Summary: ["eventType", "eventSymbol", "dayOpenPrice", "dayHighPrice", "dayLowPrice", "prevDayClosePrice"],
         },
       });
-      // Subscribe every mapped instrument — dated primary + continuous alias.
+      // Subscribe unique feed symbols — dated primary + continuous alias.
+      // Micros share the parent's dx symbol, so the Set naturally de-dupes.
       const symbols = new Set<string>();
       for (const [root, dx] of this.toDx) {
         symbols.add(dx);
-        const continuous = CONTINUOUS_SYMBOL_MAP[root];
+        const parent = PARENT_OF[root];
+        const feedRoot = parent ?? root;
+        const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[root];
         if (continuous) symbols.add(continuous);
+        // Energy: also subscribe the prior calendar month in case the front month
+        // is quiet around roll (CL/MCL are often empty without NYMEX entitlement).
+        if (feedRoot === "CL" || feedRoot === "MCL") {
+          const prev = previousDatedSymbol("CL", "Energy", "XNYM");
+          if (prev) {
+            symbols.add(prev);
+            this.linkDxAlias(prev, "CL");
+            this.linkDxAlias(prev, "MCL");
+          }
+        }
       }
       const add = [...symbols].flatMap((sym) => [
         { type: "Quote", symbol: sym },
@@ -526,16 +574,15 @@ export class DxFeedProvider extends BaseProvider {
     if (ask > 0) st.ask = ask;
     if (st.bid > 0 && st.ask > 0) {
       const mid = (st.bid + st.ask) / 2;
-      // Prefer trade prints for the last price; use mid until the first trade.
+      // Prefer trade prints for the mark price; always keep chart bars moving off
+      // the mid so thin symbols don't freeze after the first trade (ES-like liveness).
       if (!st.haveTrade) {
         const first = !st.havePrice;
         st.price = mid;
         st.havePrice = true;
         if (first) console.log(`[dxfeed] first quote ${symbol} mid @ ${mid}`);
-        // Build chart bars from quote mids when Trade events are silent (common
-        // for continuous NQ while dated contracts still print).
-        this.recordLiveBar(symbol, mid, 0);
       }
+      this.recordLiveBar(symbol, mid, 0);
     }
     this.emitQuote(symbol, st, 0);
   }
@@ -608,7 +655,8 @@ export class DxFeedProvider extends BaseProvider {
     let snapshot: Candle[] = [];
     // Once we know this gateway has no Candle entitlement, don't block chart loads.
     if (this.channelOpen.get(CHANNEL_HIST) && this.candleEntitled !== false) {
-      const continuous = CONTINUOUS_SYMBOL_MAP[symbol];
+      const feedRoot = PARENT_OF[symbol] ?? symbol;
+      const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[symbol];
       const candidates = continuous && continuous !== dx ? [dx, continuous] : [dx];
       for (const sym of candidates) {
         const bars = await this.candleSnapshot(sym, inst.pricePrecision, resolutionSec, want);
@@ -637,12 +685,14 @@ export class DxFeedProvider extends BaseProvider {
     const inst = getInstrument(symbol);
     if (!st?.havePrice || !inst) return [];
     const live = this.liveBars.get(symbol) ?? [];
-    if (live.length >= 120) return []; // already have ~2h of real ticks
-    const anchor = st.dayOpen || st.prevClose;
+    if (live.length >= 60) return []; // ~1h of real ticks is enough for a readable chart
+    const anchor = st.dayOpen || st.prevClose || (st.havePrice ? st.price : 0);
     if (!(anchor > 0)) return [];
     const firstLive = live[0]?.time;
     const end = firstLive ?? Math.floor(Date.now() / 1000 / resolutionSec) * resolutionSec;
-    const start = end - Math.min(count, 480) * resolutionSec; // up to ~8h at 1m
+    // Keep pad short so the chart doesn't look like a flat empty line.
+    const padCount = Math.min(count, live.length > 0 ? 90 : 240);
+    const start = end - padCount * resolutionSec;
     const pad: Candle[] = [];
     const px = round(anchor, inst.pricePrecision);
     for (let t = start; t < end; t += resolutionSec) {
@@ -767,6 +817,16 @@ function buildDatedSymbolMap(): Record<string, string> {
     map[inst.symbol] = computeDxFeedDatedSymbol(inst.symbol, inst.category as Category, exchange, now);
   }
   return map;
+}
+
+/** Prior energy contract (one calendar month back) for roll-window coverage. */
+function previousDatedSymbol(root: string, category: Category, exchange: string): string | null {
+  const now = Date.now();
+  // Step back ~20 days so resolveFrontMonth lands on the previous listing month.
+  const earlier = now - 20 * 86_400_000;
+  const prev = computeDxFeedDatedSymbol(root, category, exchange, earlier);
+  const cur = computeDxFeedDatedSymbol(root, category, exchange, now);
+  return prev !== cur ? prev : null;
 }
 
 /** Coerce a dxFeed numeric field (may be number, numeric string, or "NaN") to a number. */
