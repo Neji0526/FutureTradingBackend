@@ -54,6 +54,11 @@ import { analyticsOverall, analyticsTrader } from "../trading/analytics-reposito
 import { listPhaseRules, createPhaseRule, updatePhaseRule, deletePhaseRule } from "../trading/phase-rules.js";
 import { recomputeAllPhases } from "../trading/trader-stats.js";
 import type { MarketDataProvider } from "../providers/provider.js";
+import {
+  handleClickFunnelsWebhook,
+  handleOnboardingComplete,
+  handlePurchaseValidate,
+} from "../purchases/handlers.js";
 import { getPool } from "../db/pool.js";
 
 interface ServerOptions {
@@ -176,6 +181,18 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
   if (url.pathname === "/api/auth/change-password" && req.method === "POST") {
     return handleChangePassword(req, res, opts.auth);
+  }
+
+  // --- Purchases / onboarding (ClickFunnels webhook is the only writer) ---
+  if (url.pathname === "/api/webhooks/clickfunnels" && req.method === "POST") {
+    return handleClickFunnelsWebhook(req, res, json, readJson);
+  }
+  if (/^\/api\/purchases\/[^/]+\/validate$/.test(url.pathname) && req.method === "GET") {
+    const orderNumber = decodeURIComponent(url.pathname.split("/")[3] ?? "");
+    return handlePurchaseValidate(orderNumber, res, json);
+  }
+  if (url.pathname === "/api/onboarding/complete" && req.method === "POST") {
+    return handleOnboardingComplete(req, res, opts.auth, json, readJson);
   }
 
   // --- Market-data connection (Model B / byo: each user's own Databento key) ---

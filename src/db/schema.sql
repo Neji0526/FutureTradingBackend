@@ -15,6 +15,7 @@ DO $$ BEGIN CREATE TYPE "ViolationType"   AS ENUM ('DAILY_LOSS_EXCEEDED','MAX_DR
 DO $$ BEGIN CREATE TYPE "ViolationAction" AS ENUM ('REJECT_ORDER','LIQUIDATE_POSITION','SUSPEND_ACCOUNT'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 DO $$ BEGIN CREATE TYPE "ActivityType"    AS ENUM ('USER_LOGIN','ORDER_PLACEMENT','ORDER_MODIFIED','ORDER_FILLED','ORDER_CANCELLED','ORDER_REJECTED','POSITION_OPENED','POSITION_CLOSED','RULE_VIOLATION','ACCOUNT_PASSED','ACCOUNT_SUSPENSION'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 DO $$ BEGIN CREATE TYPE "TransactionType" AS ENUM ('DEPOSIT','WITHDRAWAL','FEE','TRADE','FUNDING'); EXCEPTION WHEN duplicate_object THEN null; END $$;
+DO $$ BEGIN CREATE TYPE "PurchaseStatus"  AS ENUM ('PAID','REDEEMED'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 -- Add enum values to pre-existing databases (CREATE TYPE above only fires on a fresh DB).
 ALTER TYPE "ActivityType" ADD VALUE IF NOT EXISTS 'ORDER_MODIFIED';
 
@@ -420,3 +421,43 @@ CREATE TABLE IF NOT EXISTS "MarketMark" (
   "multiplier" numeric(12,4) NOT NULL DEFAULT 1,
   "updatedAt"  timestamptz   NOT NULL DEFAULT now()
 );
+
+-- ClickFunnels purchases. Rows are created ONLY by the CF webhook — never by the website UI.
+-- Redeemed once during onboarding (one trading account per purchase).
+CREATE TABLE IF NOT EXISTS "Purchase" (
+  "id"          text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  "orderNumber" text UNIQUE NOT NULL,
+  "email"       text NOT NULL,
+  "status"      "PurchaseStatus" NOT NULL DEFAULT 'PAID',
+  "productName" text,
+  "rawPayload"  jsonb,
+  "userId"      text REFERENCES "User"("id") ON DELETE SET NULL,
+  "createdAt"   timestamptz NOT NULL DEFAULT now(),
+  "updatedAt"   timestamptz NOT NULL DEFAULT now(),
+  "redeemedAt"  timestamptz
+);
+CREATE INDEX IF NOT EXISTS "Purchase_email_idx" ON "Purchase" (lower("email"));
+CREATE INDEX IF NOT EXISTS "Purchase_status_idx" ON "Purchase" ("status");
+
+-- Purchase-gated registration profile + KYC document metadata (files on disk).
+CREATE TABLE IF NOT EXISTS "OnboardingProfile" (
+  "id"               text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  "userId"           text UNIQUE NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
+  "orderNumber"      text NOT NULL,
+  "ageRange"         text NOT NULL,
+  "country"          varchar(2) NOT NULL,
+  "acceptTerms"      boolean NOT NULL,
+  "acceptRisk"       boolean NOT NULL,
+  "idType"           text NOT NULL,
+  "addressType"      text NOT NULL,
+  "idFileName"       text NOT NULL,
+  "idFilePath"       text NOT NULL,
+  "idMimeType"       text NOT NULL,
+  "idSize"           integer NOT NULL,
+  "addressFileName"  text NOT NULL,
+  "addressFilePath"  text NOT NULL,
+  "addressMimeType"  text NOT NULL,
+  "addressSize"      integer NOT NULL,
+  "createdAt"        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS "OnboardingProfile_orderNumber_idx" ON "OnboardingProfile" ("orderNumber");

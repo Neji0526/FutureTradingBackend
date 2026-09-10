@@ -83,6 +83,11 @@ enum ActivityType {
   ACCOUNT_SUSPENSION
 }
 
+enum PurchaseStatus {
+  PAID
+  REDEEMED
+}
+
 // ----------------------------- Models -----------------------------
 
 model User {
@@ -95,9 +100,54 @@ model User {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
-  account Account?
+  account            Account?
+  purchases          Purchase[]
+  onboardingProfile  OnboardingProfile?
 
   @@index([role, status])
+}
+
+/** Registration / KYC data collected on the purchase-gated onboarding page. */
+model OnboardingProfile {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderNumber      String
+  ageRange         String
+  country          String   @db.VarChar(2)
+  acceptTerms      Boolean
+  acceptRisk       Boolean
+  idType           String
+  addressType      String
+  idFileName       String
+  idFilePath       String
+  idMimeType       String
+  idSize           Int
+  addressFileName  String
+  addressFilePath  String
+  addressMimeType  String
+  addressSize      Int
+  createdAt        DateTime @default(now())
+
+  @@index([orderNumber])
+}
+
+/** ClickFunnels purchase — written only by the CF webhook, redeemed once at onboarding. */
+model Purchase {
+  id          String         @id @default(cuid())
+  orderNumber String         @unique
+  email       String
+  status      PurchaseStatus @default(PAID)
+  productName String?
+  rawPayload  Json?
+  userId      String?
+  user        User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  redeemedAt  DateTime?
+
+  @@index([email])
+  @@index([status])
 }
 
 model Account {

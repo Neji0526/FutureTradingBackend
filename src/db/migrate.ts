@@ -15,7 +15,7 @@ async function main() {
   }
   const sql = readFileSync(join(here, "schema.sql"), "utf8");
   await getPool().query(sql);
-  console.log("✓ Database schema applied (User, Account, Rule, Position, Order, Fill, Violation, ActivityLog).");
+  console.log("✓ Database schema applied (User, Account, Rule, Position, Order, Fill, Violation, ActivityLog, Purchase, OnboardingProfile).");
   await closePool();
 }
 
