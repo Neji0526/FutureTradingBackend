@@ -1,6 +1,24 @@
 import { EventEmitter } from "node:events";
 import type { Candle, OrderBook, Quote } from "../types.js";
 
+export interface FeedSymbolStatus {
+  symbol: string;
+  /** Exchange family keyword (CME, CBOT, COMEX, NYMEX) when known. */
+  exchange: string | null;
+  /** False when the gateway listed exchanges and this root's family is absent. */
+  entitled: boolean;
+  /** Short operator/trader-facing reason when not streamable. */
+  reason: string | null;
+}
+
+export interface FeedStatus {
+  provider: string;
+  exchanges: string[];
+  /** null = unknown; true/false after Candle probes. */
+  candleEntitled: boolean | null;
+  symbols: FeedSymbolStatus[];
+}
+
 /**
  * A market-data source. Emits `quote` (all instruments, continuously) and
  * `orderbook` (only for symbols passed to setBookSymbols). Exposes historical
@@ -20,6 +38,11 @@ export interface MarketDataProvider extends EventEmitter {
   getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]>;
   /** Last quote emitted for a symbol, if any (for snapshot-on-subscribe). */
   getQuoteSnapshot(symbol: string): Quote | undefined;
+  /**
+   * Optional feed/entitlement snapshot for ops + UI (dxFeed). Other providers
+   * may omit this; live-console falls back to quote-only health.
+   */
+  getFeedStatus?(): FeedStatus;
   /** Human-readable source name for /health and logs. */
   readonly name: string;
 

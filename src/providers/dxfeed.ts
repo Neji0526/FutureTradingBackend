@@ -5,7 +5,9 @@ import { BaseProvider, round, synthBook } from "./provider.js";
 import { aggregateCandles } from "./databento-shared.js";
 import { INSTRUMENTS, getInstrument, type Category } from "../instruments.js";
 import { computeDxFeedDatedSymbol } from "../contract-code.js";
+import { isMarketOpen } from "../trading/market-hours.js";
 import type { Candle } from "../types.js";
+import type { FeedStatus } from "./provider.js";
 
 /* ------------------------------------------------------------------ *
  * DxFeedProvider — real-time market data via dxFeed's dxLink WebSocket
@@ -153,7 +155,9 @@ export class DxFeedProvider extends BaseProvider {
    * Never flip to false from a single empty product — only after repeated global misses.
    */
   private candleEntitled: boolean | null = null;
+  /** Empty Candle snapshots on entitled roots only (avoids CL killing global candles). */
   private candleEmptyStreak = 0;
+  private warnedNoCandle = false;
   /** feedRoot → retry Candle snapshots after this epoch ms (empty-result backoff). */
   private candleMissUntil = new Map<string, number>();
   /** Exchange codes returned by the auth mint (e.g. CMEfod, COMEXfod). Empty = unknown. */
@@ -413,6 +417,10 @@ export class DxFeedProvider extends BaseProvider {
       const exchanges = this.entitledExchanges.length ? this.entitledExchanges.join(", ") : "?";
       console.log(`[dxfeed] minted market-data credentials — exchanges: ${exchanges}`);
       this.warnMissingExchangeEntitlements();
+      // Drop unentitled roots from the live subscription once we know exchanges.
+      if (this.channelOpen.get(CHANNEL_FEED)) {
+        this.subscribeAllFeedSymbols("entitlements-updated");
+      }
     } catch (err) {
       console.warn("[dxfeed] auth request failed:", (err as Error).message, "— using the last known endpoint/token");
     }
@@ -607,9 +615,11 @@ export class DxFeedProvider extends BaseProvider {
   private collectFeedSymbols(): Set<string> {
     const symbols = new Set<string>();
     for (const [root, dx] of this.toDx) {
-      symbols.add(dx);
       const parent = PARENT_OF[root];
       const feedRoot = parent ?? root;
+      // Don't subscribe roots the mint said we can't receive (e.g. CL without NYMEX).
+      if (!this.isRootEntitled(feedRoot)) continue;
+      symbols.add(dx);
       const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[root];
       if (continuous) {
         symbols.add(continuous);
@@ -635,10 +645,13 @@ export class DxFeedProvider extends BaseProvider {
    */
   private checkStaleAndResubscribe(): void {
     if (!this.running || !this.authorized || !this.channelOpen.get(CHANNEL_FEED)) return;
+    // Outside Globex, silence is expected — don't thrash FEED_SUBSCRIPTION.
+    if (!isMarketOpen()) return;
     const now = Date.now();
     const staleRoots = new Set<string>();
     for (const [sym, st] of this.state) {
       if (PARENT_OF[sym]) continue; // micros follow parents
+      if (!this.isRootEntitled(sym)) continue;
       if (!st.havePrice) {
         // Never received anything — still try to wake the feed.
         if ((now - (this.lastFeedAt.get(sym) ?? now)) >= STALE_RESUBSCRIBE_MS) {
@@ -680,6 +693,27 @@ export class DxFeedProvider extends BaseProvider {
         (removed.length ? ` (drop ${removed.join(", ")})` : ""),
     );
     this.subscribeAllFeedSymbols(`stale:${actionable.join("+")}`, removed);
+  }
+
+  /** Entitlement + candle status for live-console / frontend (ops UI). */
+  getFeedStatus(): FeedStatus {
+    return {
+      provider: this.name,
+      exchanges: [...this.entitledExchanges],
+      candleEntitled: this.candleEntitled,
+      symbols: INSTRUMENTS.map((inst) => {
+        const feedRoot = PARENT_OF[inst.symbol] ?? inst.symbol;
+        const exchange = this.exchangeFamilyForRoot(feedRoot);
+        const entitled = this.isRootEntitled(feedRoot);
+        let reason: string | null = null;
+        if (!entitled && exchange) {
+          reason = `Needs ${exchange} entitlement on the dxFeed gateway account`;
+        } else if (this.candleEntitled === false) {
+          reason = "Live quotes only — Candle history not entitled on this gateway";
+        }
+        return { symbol: inst.symbol, exchange, entitled, reason };
+      }),
+    };
   }
 
   /** Recompute front-month dated dx symbol for a root (and its micro twin). */
@@ -937,19 +971,26 @@ export class DxFeedProvider extends BaseProvider {
       }
       if (snapshot.length === 0) {
         this.candleMissUntil.set(feedRoot, Date.now() + CANDLE_MISS_BACKOFF_MS);
-        this.candleEmptyStreak += 1;
-        // After several empty snapshots with zero Candle events ever, stop waiting.
-        if (this.candleEntitled !== true && this.candleEmptyStreak >= 3) {
-          this.candleEntitled = false;
-          console.warn("[dxfeed] no Candle entitlement on this gateway — live bars only for all symbols");
-        } else {
-          console.warn(
-            `[dxfeed] candle snapshot empty for ${symbol} — live bars only (retry ${feedRoot} in ${CANDLE_MISS_BACKOFF_MS / 1000}s)`,
-          );
+        // Only count empties on entitled roots so a missing NYMEX CL probe
+        // cannot flip the global Candle kill-switch for ES/NQ/YM/GC.
+        if (this.isRootEntitled(feedRoot)) {
+          this.candleEmptyStreak += 1;
+          if (this.candleEntitled !== true && this.candleEmptyStreak >= 3) {
+            this.candleEntitled = false;
+            if (!this.warnedNoCandle) {
+              this.warnedNoCandle = true;
+              console.warn("[dxfeed] no Candle entitlement on this gateway — live bars only for all symbols");
+            }
+          } else if (this.candleEntitled === true || this.candleEmptyStreak < 3) {
+            console.warn(
+              `[dxfeed] candle snapshot empty for ${symbol} — live bars only (retry ${feedRoot} in ${CANDLE_MISS_BACKOFF_MS / 1000}s)`,
+            );
+          }
         }
       } else {
         this.candleEntitled = true;
         this.candleEmptyStreak = 0;
+        this.warnedNoCandle = false;
         this.candleMissUntil.delete(feedRoot);
         console.log(`[dxfeed] candle snapshot ${symbol}: ${snapshot.length} bars`);
       }

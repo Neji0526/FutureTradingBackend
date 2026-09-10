@@ -1,11 +1,12 @@
 import type { MarketDataProvider } from "../providers/provider.js";
 import type { Quote } from "../types.js";
 import { INSTRUMENTS } from "../instruments.js";
+import { isMarketOpen } from "../trading/market-hours.js";
 
 export interface MarketLiveRow {
   symbol: string;
   name: string;
-  state: "live" | "thin" | "flat" | "stale" | "missing";
+  state: "live" | "thin" | "flat" | "stale" | "missing" | "closed" | "blocked";
   price: number | null;
   bid: number | null;
   ask: number | null;
@@ -15,7 +16,16 @@ export interface MarketLiveRow {
   change24h: number | null;
   ageSec: number | null;
   ts: number | null;
+  /** Exchange family when known (CME, CBOT, …). */
+  exchange: string | null;
+  /** False when gateway listed exchanges and this root is absent. */
+  entitled: boolean;
+  /** Operator/trader-facing reason (missing NYMEX, no candles, …). */
+  reason: string | null;
 }
+
+/** Align with dxFeed stale resubscribe — thin products often tick >5s apart. */
+const STALE_AGE_MS = 30_000;
 
 /**
  * Backend market live console — prints every instrument's quote health to stdout
@@ -76,6 +86,9 @@ export function startMarketLiveConsole(provider: MarketDataProvider): () => void
 export function getMarketLiveState(): {
   provider: string;
   at: string;
+  marketOpen: boolean;
+  exchanges: string[];
+  candleEntitled: boolean | null;
   markets: MarketLiveRow[];
 } {
   const provider = sharedProvider;
@@ -87,9 +100,13 @@ export function getMarketLiveState(): {
       if (snap) latest.set(inst.symbol, snap);
     }
   }
+  const feed = provider?.getFeedStatus?.();
   return {
     provider: provider?.name ?? "none",
     at: new Date().toISOString(),
+    marketOpen: isMarketOpen(),
+    exchanges: feed?.exchanges ?? [],
+    candleEntitled: feed?.candleEntitled ?? null,
     markets: provider ? buildLiveRows(provider, latest) : [],
   };
 }
@@ -99,13 +116,21 @@ function buildLiveRows(
   latest: Map<string, Quote>,
 ): MarketLiveRow[] {
   const now = Date.now();
+  const open = isMarketOpen();
+  const feed = provider.getFeedStatus?.();
+  const bySym = new Map(feed?.symbols.map((s) => [s.symbol, s]) ?? []);
+
   return INSTRUMENTS.map((inst) => {
-    const q = latest.get(inst.symbol) ?? provider.getQuoteSnapshot(inst.symbol);
-    if (!q) {
+    const meta = bySym.get(inst.symbol);
+    const entitled = meta?.entitled ?? true;
+    const exchange = meta?.exchange ?? null;
+    const reason = meta?.reason ?? null;
+
+    if (!entitled) {
       return {
         symbol: inst.symbol,
         name: inst.name,
-        state: "missing",
+        state: "blocked",
         price: null,
         bid: null,
         ask: null,
@@ -115,15 +140,42 @@ function buildLiveRows(
         change24h: null,
         ageSec: null,
         ts: null,
+        exchange,
+        entitled: false,
+        reason,
       };
     }
+
+    const q = latest.get(inst.symbol) ?? provider.getQuoteSnapshot(inst.symbol);
+    if (!q) {
+      return {
+        symbol: inst.symbol,
+        name: inst.name,
+        state: open ? "missing" : "closed",
+        price: null,
+        bid: null,
+        ask: null,
+        high24h: null,
+        low24h: null,
+        volume24h: null,
+        change24h: null,
+        ageSec: null,
+        ts: null,
+        exchange,
+        entitled: true,
+        reason: open
+          ? (reason ?? "No quote yet — waiting for feed or check gateway entitlements")
+          : "Market closed (CME Globex session)",
+      };
+    }
+
     const ageMs = now - (q.ts || now);
     const flat =
       q.high24h === q.low24h && q.high24h === q.price && (q.volume24h ?? 0) === 0;
-    const stale = ageMs > 5_000;
     let state: MarketLiveRow["state"] = "thin";
-    if (flat) state = "flat";
-    else if (stale) state = "stale";
+    if (!open) state = "closed";
+    else if (flat) state = "flat";
+    else if (ageMs > STALE_AGE_MS) state = "stale";
     else if ((q.volume24h ?? 0) > 0) state = "live";
 
     return {
@@ -139,44 +191,59 @@ function buildLiveRows(
       change24h: q.change24h,
       ageSec: Number((ageMs / 1000).toFixed(1)),
       ts: q.ts,
+      exchange,
+      entitled: true,
+      reason: state === "stale" ? "Feed quiet — backend will resubscribe" : reason,
     };
   });
 }
 
 function printLiveTable(providerName: string, rows: MarketLiveRow[]): void {
-  const counts = { live: 0, thin: 0, flat: 0, stale: 0, missing: 0 };
+  const counts = {
+    live: 0,
+    thin: 0,
+    flat: 0,
+    stale: 0,
+    missing: 0,
+    closed: 0,
+    blocked: 0,
+  };
   for (const r of rows) counts[r.state] += 1;
 
+  const feed = sharedProvider?.getFeedStatus?.();
   const lines: string[] = [];
   lines.push("");
   lines.push("========== MARKET LIVE STATE ==========");
   lines.push(
-    `provider=${providerName}  at=${new Date().toISOString()}  ` +
-      `live=${counts.live} thin=${counts.thin} flat=${counts.flat} stale=${counts.stale} missing=${counts.missing}`,
+    `provider=${providerName}  at=${new Date().toISOString()}  marketOpen=${isMarketOpen()}  ` +
+      `live=${counts.live} thin=${counts.thin} flat=${counts.flat} stale=${counts.stale} ` +
+      `missing=${counts.missing} blocked=${counts.blocked} closed=${counts.closed}`,
   );
+  if (feed) {
+    const ex = feed.exchanges.length ? feed.exchanges.join(",") : "(unknown)";
+    lines.push(
+      `exchanges=${ex}  candleEntitled=${feed.candleEntitled === null ? "?" : feed.candleEntitled}`,
+    );
+  }
   lines.push(
     pad("SYM", 5) +
       pad("STATE", 9) +
+      pad("EX", 7) +
       pad("LAST", 12) +
-      pad("BID", 12) +
-      pad("ASK", 12) +
-      pad("HIGH", 12) +
-      pad("LOW", 12) +
       pad("VOL24H", 10) +
-      pad("AGE", 7),
+      pad("AGE", 7) +
+      "REASON",
   );
-  lines.push("-".repeat(91));
+  lines.push("-".repeat(100));
   for (const r of rows) {
     lines.push(
       pad(r.symbol, 5) +
         pad(r.state, 9) +
+        pad(r.exchange ?? "—", 7) +
         pad(fmt(r.price), 12) +
-        pad(fmt(r.bid), 12) +
-        pad(fmt(r.ask), 12) +
-        pad(fmt(r.high24h), 12) +
-        pad(fmt(r.low24h), 12) +
         pad(r.volume24h == null ? "—" : String(Math.round(r.volume24h)), 10) +
-        pad(r.ageSec == null ? "—" : `${r.ageSec}s`, 7),
+        pad(r.ageSec == null ? "—" : `${r.ageSec}s`, 7) +
+        (r.reason ?? ""),
     );
   }
   lines.push("=======================================");
