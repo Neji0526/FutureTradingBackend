@@ -45,6 +45,12 @@ const HISTORY_MAX_BARS = 2_500;
 const CANDLE_MISS_BACKOFF_MS = 45_000;
 const LIVE_BARS_FILE = path.join(process.cwd(), "data", "dxfeed-live-bars.json");
 const LIVE_BARS_SAVE_MS = 5_000;
+/** How often to scan for symbols that stopped receiving Quote/Trade/Summary. */
+const STALE_WATCH_MS = 30_000;
+/** No feed event for this long → refresh dated map + resubscribe that root. */
+const STALE_RESUBSCRIBE_MS = 45_000;
+/** Don't hammer the same root with resubscribes more often than this. */
+const STALE_RESUBSCRIBE_COOLDOWN_MS = 60_000;
 
 const CHANNEL_FEED = 1; // live Quote/Trade/Summary
 const CHANNEL_HIST = 3; // on-demand Candle snapshots
@@ -124,6 +130,7 @@ export class DxFeedProvider extends BaseProvider {
   private retries = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private keepaliveTimer: NodeJS.Timeout | null = null;
+  private staleWatchTimer: NodeJS.Timeout | null = null;
 
   private readonly state = new Map<string, SymState>();
   private readonly toDx = new Map<string, string>(); // internal → dxFeed symbol
@@ -134,6 +141,10 @@ export class DxFeedProvider extends BaseProvider {
   private readonly bookEmitAt = new Map<string, number>();
   private readonly quoteEmitAt = new Map<string, number>();
   private readonly lastEmittedPrice = new Map<string, number>();
+  /** Last Quote/Trade/Summary wall time per internal symbol (stale watchdog). */
+  private readonly lastFeedAt = new Map<string, number>();
+  /** Last resubscribe attempt per feed root (cooldown). */
+  private readonly lastResubscribeAt = new Map<string, number>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
   private readonly hist = new Map<string, HistPending>();
   /**
@@ -276,6 +287,9 @@ export class DxFeedProvider extends BaseProvider {
   start(): void {
     if (this.running) return;
     this.running = true;
+    if (!this.staleWatchTimer) {
+      this.staleWatchTimer = setInterval(() => this.checkStaleAndResubscribe(), STALE_WATCH_MS);
+    }
     void this.connect();
   }
 
@@ -283,7 +297,8 @@ export class DxFeedProvider extends BaseProvider {
     this.running = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
-    this.reconnectTimer = this.keepaliveTimer = null;
+    if (this.staleWatchTimer) clearInterval(this.staleWatchTimer);
+    this.reconnectTimer = this.keepaliveTimer = this.staleWatchTimer = null;
     if (this.liveBarsSaveTimer) clearInterval(this.liveBarsSaveTimer);
     this.liveBarsSaveTimer = null;
     this.saveLiveBars();
@@ -544,33 +559,10 @@ export class DxFeedProvider extends BaseProvider {
           Summary: ["eventType", "eventSymbol", "dayOpenPrice", "dayHighPrice", "dayLowPrice", "prevDayClosePrice"],
         },
       });
-      // Subscribe unique feed symbols — dated primary + continuous alias.
-      // Micros share the parent's dx symbol, so the Set naturally de-dupes.
-      const symbols = new Set<string>();
-      for (const [root, dx] of this.toDx) {
-        symbols.add(dx);
-        const parent = PARENT_OF[root];
-        const feedRoot = parent ?? root;
-        const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[root];
-        if (continuous) symbols.add(continuous);
-        // Energy: also subscribe the prior calendar month in case the front month
-        // is quiet around roll (CL/MCL are often empty without NYMEX entitlement).
-        if (feedRoot === "CL" || feedRoot === "MCL") {
-          const prev = previousDatedSymbol("CL", "Energy", "XNYM");
-          if (prev) {
-            symbols.add(prev);
-            this.linkDxAlias(prev, "CL");
-            this.linkDxAlias(prev, "MCL");
-          }
-        }
-      }
-      const add = [...symbols].flatMap((sym) => [
-        { type: "Quote", symbol: sym },
-        { type: "Trade", symbol: sym },
-        { type: "Summary", symbol: sym },
-      ]);
-      this.send({ type: "FEED_SUBSCRIPTION", channel: CHANNEL_FEED, add });
-      console.log(`[dxfeed] subscribed ${symbols.size} feed symbols (Quote/Trade/Summary)`);
+      // Seed lastFeedAt so the watchdog doesn't immediately thrash on cold start.
+      const now = Date.now();
+      for (const sym of this.state.keys()) this.lastFeedAt.set(sym, now);
+      this.subscribeAllFeedSymbols("initial");
     } else if (channel === CHANNEL_HIST) {
       this.send({
         type: "FEED_SETUP",
@@ -581,6 +573,128 @@ export class DxFeedProvider extends BaseProvider {
           Candle: ["eventType", "eventSymbol", "time", "open", "high", "low", "close", "volume"],
         },
       });
+    }
+  }
+
+  /**
+   * Build the set of dxFeed symbols to stream (dated front + continuous + adjacent
+   * months for roll windows) and send FEED_SUBSCRIPTION.
+   */
+  private subscribeAllFeedSymbols(reason: string, remove: string[] = []): void {
+    if (!this.channelOpen.get(CHANNEL_FEED)) return;
+    const symbols = this.collectFeedSymbols();
+    if (remove.length) {
+      this.send({
+        type: "FEED_SUBSCRIPTION",
+        channel: CHANNEL_FEED,
+        remove: remove.flatMap((sym) => [
+          { type: "Quote", symbol: sym },
+          { type: "Trade", symbol: sym },
+          { type: "Summary", symbol: sym },
+        ]),
+      });
+    }
+    const add = [...symbols].flatMap((sym) => [
+      { type: "Quote", symbol: sym },
+      { type: "Trade", symbol: sym },
+      { type: "Summary", symbol: sym },
+    ]);
+    this.send({ type: "FEED_SUBSCRIPTION", channel: CHANNEL_FEED, add });
+    console.log(`[dxfeed] subscribed ${symbols.size} feed symbols (Quote/Trade/Summary) — ${reason}`);
+  }
+
+  /** Unique dx symbols for live Quote/Trade/Summary (dated + continuous + adjacent). */
+  private collectFeedSymbols(): Set<string> {
+    const symbols = new Set<string>();
+    for (const [root, dx] of this.toDx) {
+      symbols.add(dx);
+      const parent = PARENT_OF[root];
+      const feedRoot = parent ?? root;
+      const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[root];
+      if (continuous) {
+        symbols.add(continuous);
+        this.linkDxAlias(continuous, root);
+        if (parent) this.linkDxAlias(continuous, parent);
+        const micro = MICRO_OF[feedRoot];
+        if (micro) this.linkDxAlias(continuous, micro);
+      }
+      // Adjacent months: quiet front month / roll windows (not just energy).
+      for (const adj of adjacentDatedSymbols(feedRoot)) {
+        symbols.add(adj);
+        this.linkDxAlias(adj, feedRoot);
+        const micro = MICRO_OF[feedRoot];
+        if (micro) this.linkDxAlias(adj, micro);
+      }
+    }
+    return symbols;
+  }
+
+  /**
+   * NQ/YM/GC often get one thin Quote then go silent while ES/CL keep ticking.
+   * Detect rising AGE and refresh dated contracts + re-add FEED_SUBSCRIPTION.
+   */
+  private checkStaleAndResubscribe(): void {
+    if (!this.running || !this.authorized || !this.channelOpen.get(CHANNEL_FEED)) return;
+    const now = Date.now();
+    const staleRoots = new Set<string>();
+    for (const [sym, st] of this.state) {
+      if (PARENT_OF[sym]) continue; // micros follow parents
+      if (!st.havePrice) {
+        // Never received anything — still try to wake the feed.
+        if ((now - (this.lastFeedAt.get(sym) ?? now)) >= STALE_RESUBSCRIBE_MS) {
+          staleRoots.add(sym);
+        }
+        continue;
+      }
+      const age = now - (this.lastFeedAt.get(sym) ?? 0);
+      if (age >= STALE_RESUBSCRIBE_MS) staleRoots.add(sym);
+    }
+    if (!staleRoots.size) return;
+
+    const actionable: string[] = [];
+    for (const root of staleRoots) {
+      if (!this.isRootEntitled(root)) continue;
+      const last = this.lastResubscribeAt.get(root) ?? 0;
+      if (now - last < STALE_RESUBSCRIBE_COOLDOWN_MS) continue;
+      actionable.push(root);
+      this.lastResubscribeAt.set(root, now);
+    }
+    if (!actionable.length) return;
+
+    const removed: string[] = [];
+    for (const root of actionable) {
+      const oldDx = this.toDx.get(root);
+      this.refreshDatedSymbol(root);
+      const newDx = this.toDx.get(root);
+      if (oldDx && newDx && oldDx !== newDx) removed.push(oldDx);
+      // Force next tick to emit even if price unchanged after resubscribe.
+      this.lastEmittedPrice.delete(root);
+      const micro = MICRO_OF[root];
+      if (micro) this.lastEmittedPrice.delete(micro);
+      this.lastFeedAt.set(root, now);
+      if (micro) this.lastFeedAt.set(micro, now);
+    }
+
+    console.warn(
+      `[dxfeed] stale feed — resubscribing ${actionable.join(", ")}` +
+        (removed.length ? ` (drop ${removed.join(", ")})` : ""),
+    );
+    this.subscribeAllFeedSymbols(`stale:${actionable.join("+")}`, removed);
+  }
+
+  /** Recompute front-month dated dx symbol for a root (and its micro twin). */
+  private refreshDatedSymbol(root: string): void {
+    const inst = getInstrument(root);
+    const exchange = EXCHANGE_BY_ROOT[root];
+    if (!inst || !exchange) return;
+    if (process.env.DXFEED_SYMBOL_MAP) return; // honor explicit overrides
+    const dx = computeDxFeedDatedSymbol(root, inst.category as Category, exchange);
+    this.toDx.set(root, dx);
+    this.linkDxAlias(dx, root);
+    const micro = MICRO_OF[root];
+    if (micro) {
+      this.toDx.set(micro, dx);
+      this.linkDxAlias(dx, micro);
     }
   }
 
@@ -618,6 +732,7 @@ export class DxFeedProvider extends BaseProvider {
   private onTrade(symbol: string, st: SymState, e: Record<string, unknown>): void {
     const price = num(e.price);
     if (!Number.isFinite(price) || price <= 0) return;
+    this.touchFeed(symbol);
     const first = !st.havePrice;
     st.price = price;
     st.havePrice = true;
@@ -665,6 +780,8 @@ export class DxFeedProvider extends BaseProvider {
   private onQuote(symbol: string, st: SymState, e: Record<string, unknown>): void {
     const bid = num(e.bidPrice);
     const ask = num(e.askPrice);
+    if (bid <= 0 && ask <= 0) return;
+    this.touchFeed(symbol);
     if (bid > 0) st.bid = bid;
     if (ask > 0) st.ask = ask;
     if (st.bid > 0 && st.ask > 0) {
@@ -684,6 +801,7 @@ export class DxFeedProvider extends BaseProvider {
   }
 
   private onSummary(symbol: string, st: SymState, e: Record<string, unknown>): void {
+    this.touchFeed(symbol);
     st.dayOpen = num(e.dayOpenPrice) || st.dayOpen;
     st.high = num(e.dayHighPrice) || st.high;
     st.low = num(e.dayLowPrice) || st.low;
@@ -700,6 +818,16 @@ export class DxFeedProvider extends BaseProvider {
       }
     }
     this.emitQuote(symbol, st, 0);
+  }
+
+  /** Mark that this internal symbol (and micro twin) still has a live dxFeed stream. */
+  private touchFeed(symbol: string): void {
+    const now = Date.now();
+    this.lastFeedAt.set(symbol, now);
+    const micro = MICRO_OF[symbol];
+    if (micro) this.lastFeedAt.set(micro, now);
+    const parent = PARENT_OF[symbol];
+    if (parent) this.lastFeedAt.set(parent, now);
   }
 
   private emitQuote(symbol: string, st: SymState, lastSize: number): void {
@@ -977,6 +1105,32 @@ function previousDatedSymbol(root: string, category: Category, exchange: string)
   const prev = computeDxFeedDatedSymbol(root, category, exchange, earlier);
   const cur = computeDxFeedDatedSymbol(root, category, exchange, now);
   return prev !== cur ? prev : null;
+}
+
+/** Next listing month (roll-forward) when the current front is quiet. */
+function nextDatedSymbol(root: string, category: Category, exchange: string): string | null {
+  const now = Date.now();
+  const later = now + 35 * 86_400_000;
+  const next = computeDxFeedDatedSymbol(root, category, exchange, later);
+  const cur = computeDxFeedDatedSymbol(root, category, exchange, now);
+  return next !== cur ? next : null;
+}
+
+/**
+ * Adjacent dated contracts for roll / quiet-front coverage.
+ * Applied to every entitled root (index + metals + energy), not only CL.
+ */
+function adjacentDatedSymbols(feedRoot: string): string[] {
+  const inst = getInstrument(feedRoot);
+  const exchange = EXCHANGE_BY_ROOT[feedRoot];
+  if (!inst || !exchange) return [];
+  const cat = inst.category as Category;
+  const out: string[] = [];
+  const prev = previousDatedSymbol(feedRoot, cat, exchange);
+  const next = nextDatedSymbol(feedRoot, cat, exchange);
+  if (prev) out.push(prev);
+  if (next) out.push(next);
+  return out;
 }
 
 /** Coerce a dxFeed numeric field (may be number, numeric string, or "NaN") to a number. */
