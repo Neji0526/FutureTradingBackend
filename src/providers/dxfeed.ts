@@ -134,10 +134,11 @@ export class DxFeedProvider extends BaseProvider {
   private readonly hist = new Map<string, HistPending>();
   /**
    * null = unknown; true = at least one product returned Candle history.
-   * Never flip to false from a single empty product (CL without NYMEX used to
-   * poison NQ/YM/GC and skip Candle waits for every chart).
+   * false = HISTORY channel never delivered Candle events (skip waiting).
+   * Never flip to false from a single empty product — only after repeated global misses.
    */
   private candleEntitled: boolean | null = null;
+  private candleEmptyStreak = 0;
   /** feedRoot → retry Candle snapshots after this epoch ms (empty-result backoff). */
   private candleMissUntil = new Map<string, number>();
   /* Live-built 1-minute bars per symbol, oldest first.
@@ -582,14 +583,15 @@ export class DxFeedProvider extends BaseProvider {
     if (ask > 0) st.ask = ask;
     if (st.bid > 0 && st.ask > 0) {
       const mid = (st.bid + st.ask) / 2;
-      // Prefer trade prints for the mark price; always keep chart bars moving off
-      // the mid so thin symbols don't freeze after the first trade (ES-like liveness).
-      if (!st.haveTrade) {
-        const first = !st.havePrice;
-        st.price = mid;
-        st.havePrice = true;
-        if (first) console.log(`[dxfeed] first quote ${symbol} mid @ ${mid}`);
-      }
+      // ALWAYS advance the mark from BBO. Thin products (NQ/YM/GC on this feed)
+      // often quote continuously but trade rarely — updating price only on Trade
+      // froze headers/charts while ES (busy prints) still looked live.
+      const first = !st.havePrice;
+      st.price = mid;
+      st.havePrice = true;
+      if (first) console.log(`[dxfeed] first quote ${symbol} mid @ ${mid}`);
+      if (st.high) st.high = Math.max(st.high, mid);
+      if (st.low) st.low = Math.min(st.low, mid);
       this.recordLiveBar(symbol, mid, 0);
     }
     this.emitQuote(symbol, st, 0);
@@ -669,11 +671,11 @@ export class DxFeedProvider extends BaseProvider {
       await waitFor(() => this.channelOpen.get(CHANNEL_HIST) === true, 2_500);
     }
 
-    // Per-root backoff after an empty snapshot — never disable Candle globally.
-    if (this.channelOpen.get(CHANNEL_HIST) && Date.now() >= missUntil) {
+    // Per-root backoff after an empty snapshot — never disable Candle from one product.
+    // Once the gateway has proven it never sends Candle events, skip the wait entirely
+    // so charts load from live bars in milliseconds (this feed is quote-only).
+    if (this.channelOpen.get(CHANNEL_HIST) && this.candleEntitled !== false && Date.now() >= missUntil) {
       const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[symbol];
-      // Prefer continuous for history (often better entitled); dated as fallback.
-      // Run in parallel so two empty waits don't stack to 2× timeout.
       const candidates = continuous && continuous !== dx ? [continuous, dx] : [dx];
       const results = await Promise.all(
         candidates.map((sym) => this.candleSnapshot(sym, inst.pricePrecision, resolutionSec, want)),
@@ -683,11 +685,19 @@ export class DxFeedProvider extends BaseProvider {
       }
       if (snapshot.length === 0) {
         this.candleMissUntil.set(feedRoot, Date.now() + CANDLE_MISS_BACKOFF_MS);
-        console.warn(
-          `[dxfeed] candle snapshot empty for ${symbol} — live bars only (retry ${feedRoot} in ${CANDLE_MISS_BACKOFF_MS / 1000}s)`,
-        );
+        this.candleEmptyStreak += 1;
+        // After several empty snapshots with zero Candle events ever, stop waiting.
+        if (this.candleEntitled !== true && this.candleEmptyStreak >= 3) {
+          this.candleEntitled = false;
+          console.warn("[dxfeed] no Candle entitlement on this gateway — live bars only for all symbols");
+        } else {
+          console.warn(
+            `[dxfeed] candle snapshot empty for ${symbol} — live bars only (retry ${feedRoot} in ${CANDLE_MISS_BACKOFF_MS / 1000}s)`,
+          );
+        }
       } else {
         this.candleEntitled = true;
+        this.candleEmptyStreak = 0;
         this.candleMissUntil.delete(feedRoot);
         console.log(`[dxfeed] candle snapshot ${symbol}: ${snapshot.length} bars`);
       }
