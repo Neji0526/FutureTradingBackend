@@ -39,12 +39,18 @@ const QUOTE_EMIT_MIN_MS = 100;
 // often take 1–3s before the first Candle event, and a pre-armed 700ms idle
 // was finishing empty (blank charts, volume stuck at 0).
 const HISTORY_IDLE_MS = 1_200;
-/** Overall cap per candle request. No Candle entitlement → empty after this, then live bars. */
-const HISTORY_MAX_MS = 2_500;
-/** Cap how far back we ask dxFeed for candles (large windows stall or empty-out). */
-const HISTORY_MAX_BARS = 2_500;
+/** Cap wait for a Candle snapshot. Deep history needs more than a couple seconds. */
+const HISTORY_MAX_MS = 10_000;
+/** Max bars we ask dxFeed for (1m ≈ several trading days). Live bars still append on top. */
+const HISTORY_MAX_BARS = 8_000;
 /** After an empty Candle snapshot, retry this root no sooner than this (ms). */
 const CANDLE_MISS_BACKOFF_MS = 45_000;
+/**
+ * Even after we conclude the gateway has no Candle entitlement, keep re-probing
+ * on this interval so enabling Candle on Volumetrica starts serving deep history
+ * without a process restart.
+ */
+const CANDLE_REPROBE_MS = 15 * 60_000;
 const LIVE_BARS_FILE = path.join(process.cwd(), "data", "dxfeed-live-bars.json");
 const LIVE_BARS_SAVE_MS = 5_000;
 /** How often to scan for symbols that stopped receiving Quote/Trade/Summary. */
@@ -56,7 +62,8 @@ const STALE_RESUBSCRIBE_COOLDOWN_MS = 60_000;
 
 const CHANNEL_FEED = 1; // live Quote/Trade/Summary
 const CHANNEL_HIST = 3; // on-demand Candle snapshots
-const LIVE_BAR_CAP = 1500; // ~25h of live-built 1-minute bars per symbol
+/** ~1 week of live-built 1-minute bars while Candle entitlement is pending. */
+const LIVE_BAR_CAP = 10_000;
 
 /** CME exchange suffix per root (continuous form: /NQ:XCME). */
 const EXCHANGE_BY_ROOT: Record<string, string> = {
@@ -173,6 +180,8 @@ export class DxFeedProvider extends BaseProvider {
   /** Empty Candle snapshots on entitled roots only (avoids CL killing global candles). */
   private candleEmptyStreak = 0;
   private warnedNoCandle = false;
+  /** Next time we may re-probe Candle after concluding the gateway has none. */
+  private candleReprobeAt = 0;
   /** feedRoot → retry Candle snapshots after this epoch ms (empty-result backoff). */
   private candleMissUntil = new Map<string, number>();
   /** Exchange codes returned by the auth mint (e.g. CMEfod, COMEXfod). Empty = unknown. */
@@ -1033,10 +1042,24 @@ export class DxFeedProvider extends BaseProvider {
       await waitFor(() => this.channelOpen.get(CHANNEL_HIST) === true, 2_500);
     }
 
+    // If we previously concluded "no Candle", still re-probe on a timer so enabling
+    // Candle on Volumetrica starts returning deep history without a restart.
+    if (this.candleEntitled === false && Date.now() >= this.candleReprobeAt) {
+      this.candleEntitled = null;
+      this.candleEmptyStreak = 0;
+      this.candleReprobeAt = Date.now() + CANDLE_REPROBE_MS;
+      console.log("[dxfeed] re-probing Candle entitlement (deep history + live merge)");
+    }
+
     // Per-root backoff after an empty snapshot — never disable Candle from one product.
-    // Once the gateway has proven it never sends Candle events, skip the wait entirely
-    // so charts load from live bars in milliseconds (this feed is quote-only).
-    if (this.channelOpen.get(CHANNEL_HIST) && this.candleEntitled !== false && Date.now() >= missUntil) {
+    // Once the gateway has proven it never sends Candle events, skip the wait until
+    // the next re-probe — charts still load from live bars in the meantime.
+    const tryCandle =
+      this.channelOpen.get(CHANNEL_HIST) &&
+      this.candleEntitled !== false &&
+      Date.now() >= missUntil;
+
+    if (tryCandle) {
       const continuous = CONTINUOUS_SYMBOL_MAP[feedRoot] ?? CONTINUOUS_SYMBOL_MAP[symbol];
       const candidates = continuous && continuous !== dx ? [continuous, dx] : [dx];
       // Energy: also try the prior month contract around rolls.
@@ -1058,9 +1081,13 @@ export class DxFeedProvider extends BaseProvider {
           this.candleEmptyStreak += 1;
           if (this.candleEntitled !== true && this.candleEmptyStreak >= 3) {
             this.candleEntitled = false;
+            this.candleReprobeAt = Date.now() + CANDLE_REPROBE_MS;
             if (!this.warnedNoCandle) {
               this.warnedNoCandle = true;
-              console.warn("[dxfeed] no Candle entitlement on this gateway — live bars only for all symbols");
+              console.warn(
+                "[dxfeed] no Candle entitlement on this gateway — live bars only for now; " +
+                  `will re-probe deep history in ${CANDLE_REPROBE_MS / 60_000}m`,
+              );
             }
           } else if (this.candleEntitled === true || this.candleEmptyStreak < 3) {
             console.warn(
@@ -1069,13 +1096,18 @@ export class DxFeedProvider extends BaseProvider {
           }
         }
       } else {
+        const wasOff = this.candleEntitled === false;
         this.candleEntitled = true;
         this.candleEmptyStreak = 0;
         this.warnedNoCandle = false;
         this.candleMissUntil.delete(feedRoot);
-        console.log(`[dxfeed] candle snapshot ${symbol}: ${snapshot.length} bars`);
+        console.log(
+          `[dxfeed] candle snapshot ${symbol}: ${snapshot.length} bars` +
+            (wasOff ? " (Candle entitlement restored — deep + live)" : " (deep + live merge)"),
+        );
       }
     }
+    // Always merge: deep Candle snapshot (when available) + live quote-built bars.
     return this.mergeLiveBars(symbol, snapshot, resolutionSec, want);
   }
 
