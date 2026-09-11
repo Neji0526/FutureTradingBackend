@@ -102,6 +102,15 @@ const MICRO_OF: Record<string, string> = {
 /** Month codes used when stripping a dated CME root from an eventSymbol. */
 const MONTH_CODE_RE = /[FGHJKMNQUVXZ]\d{1,2}$/;
 
+/** Max 1m bar range in ticks before we treat high/low as corrupt (dual-contract mix). */
+const LIVE_BAR_MAX_RANGE_TICKS = 120;
+
+/** True for continuous forms like /ES:XCME (no month code), false for /ESU26:XCME. */
+function isContinuousDxSymbol(dx: string): boolean {
+  const bare = (dx.startsWith("/") ? dx.slice(1) : dx).split(":")[0] ?? "";
+  return bare.length > 0 && !MONTH_CODE_RE.test(bare);
+}
+
 interface SymState {
   price: number;
   bid: number;
@@ -147,6 +156,12 @@ export class DxFeedProvider extends BaseProvider {
   private readonly lastFeedAt = new Map<string, number>();
   /** Last resubscribe attempt per feed root (cooldown). */
   private readonly lastResubscribeAt = new Map<string, number>();
+  /**
+   * Feed roots that have received Quote/Trade from their primary dated dx symbol.
+   * Once set, continuous / adjacent-month events are ignored for price/live bars
+   * so two contracts (~7604 vs ~7670) cannot stretch every candle across the day range.
+   */
+  private readonly primaryDxReady = new Set<string>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
   private readonly hist = new Map<string, HistPending>();
   /**
@@ -323,9 +338,12 @@ export class DxFeedProvider extends BaseProvider {
       const raw = JSON.parse(readFileSync(LIVE_BARS_FILE, "utf8")) as Record<string, Candle[]>;
       const cutoff = Math.floor(Date.now() / 1000) - LIVE_BAR_CAP * 60;
       let n = 0;
+      let dropped = 0;
       for (const [sym, bars] of Object.entries(raw)) {
         if (!this.state.has(sym) || !Array.isArray(bars)) continue;
-        const kept = bars.filter((b) => b && b.time >= cutoff && b.close > 0).slice(-LIVE_BAR_CAP);
+        const cleaned = this.sanitizeLiveBars(sym, bars.filter((b) => b && b.time >= cutoff && b.close > 0));
+        dropped += Math.max(0, bars.length - cleaned.length);
+        const kept = cleaned.slice(-LIVE_BAR_CAP);
         if (kept.length) {
           this.liveBars.set(sym, kept);
           n += kept.length;
@@ -334,7 +352,7 @@ export class DxFeedProvider extends BaseProvider {
       // Micros share the parent's price stream — keep both buffers filled so MES
       // never looks empty while ES has depth (and the same for MNQ/MYM/MGC/MCL).
       this.syncPiggybackLiveBars();
-      if (n) console.log(`[dxfeed] restored ${n} live bars from disk`);
+      if (n) console.log(`[dxfeed] restored ${n} live bars from disk` + (dropped ? ` (dropped ${dropped} corrupt)` : ""));
     } catch (err) {
       console.warn("[dxfeed] could not load live bars:", (err as Error).message);
     }
@@ -743,24 +761,53 @@ export class DxFeedProvider extends BaseProvider {
         this.onCandle(e);
         continue;
       }
-      const symbols = this.resolveEventSymbols(String(e.eventSymbol));
+      const eventSymbol = String(e.eventSymbol ?? "");
+      const symbols = this.resolveEventSymbols(eventSymbol);
       if (!symbols) continue;
       for (const symbol of symbols) {
         const st = this.state.get(symbol);
         if (!st) continue;
         switch (e.eventType) {
           case "Trade":
+            if (!this.acceptPriceEvent(symbol, eventSymbol)) break;
             this.onTrade(symbol, st, e);
             break;
           case "Quote":
+            if (!this.acceptPriceEvent(symbol, eventSymbol)) break;
             this.onQuote(symbol, st, e);
             break;
           case "Summary":
+            // Summary day levels are per-contract; only apply from the preferred source.
+            if (!this.acceptPriceEvent(symbol, eventSymbol)) break;
             this.onSummary(symbol, st, e);
             break;
         }
       }
     }
+  }
+
+  /**
+   * Once the primary dated contract (toDx) has printed, ignore continuous and
+   * adjacent-month quotes — mixing them paints every 1m candle as a full-day wick.
+   */
+  private acceptPriceEvent(internal: string, eventSymbol: string): boolean {
+    const feedRoot = PARENT_OF[internal] ?? internal;
+    const primary = this.toDx.get(internal) ?? this.toDx.get(feedRoot);
+    const base = eventSymbol.replace(/\{=[^}]*\}$/, "");
+    if (!primary) return true;
+
+    if (base === primary) {
+      this.primaryDxReady.add(feedRoot);
+      return true;
+    }
+
+    // Primary dated is live → drop continuous and other months for this root.
+    if (this.primaryDxReady.has(feedRoot)) {
+      return false;
+    }
+
+    // Before primary arrives, allow continuous (and only continuous) as warmup.
+    return isContinuousDxSymbol(base);
   }
 
   private onTrade(symbol: string, st: SymState, e: Record<string, unknown>): void {
@@ -772,6 +819,7 @@ export class DxFeedProvider extends BaseProvider {
     st.havePrice = true;
     st.haveTrade = true;
     st.volume = num(e.dayVolume) || st.volume;
+    // Session high/low for the header — not used as live-bar prints.
     if (st.high) st.high = Math.max(st.high, price);
     if (st.low) st.low = Math.min(st.low, price);
     if (first) console.log(`[dxfeed] first trade ${symbol} @ ${price}`);
@@ -781,11 +829,19 @@ export class DxFeedProvider extends BaseProvider {
 
   /** Fold one trade/quote print into the current minute's bar for `symbol`. */
   private recordLiveBar(symbol: string, price: number, size: number): void {
+    if (!Number.isFinite(price) || price <= 0) return;
+    const inst = getInstrument(symbol);
+    const tick = inst?.tickSize ?? 0.25;
+    const maxJump = tick * LIVE_BAR_MAX_RANGE_TICKS;
     const minute = Math.floor(Date.now() / 60_000) * 60; // bar time, seconds
     let bars = this.liveBars.get(symbol);
     if (!bars) { bars = []; this.liveBars.set(symbol, bars); }
     const open = bars[bars.length - 1];
     if (open && open.time === minute) {
+      // Reject dual-contract spikes that would stretch the wick across the day range.
+      if (Math.abs(price - open.close) > maxJump && Math.abs(price - open.open) > maxJump) {
+        return;
+      }
       open.high = Math.max(open.high, price);
       open.low = Math.min(open.low, price);
       open.close = price;
@@ -797,6 +853,10 @@ export class DxFeedProvider extends BaseProvider {
     // Out-of-order print for a minute we already closed: drop it rather than
     // append, which would put the series out of order and break the chart.
     if (open && open.time > minute) return;
+    if (open && Math.abs(price - open.close) > maxJump) {
+      // New minute but price jumped from a different contract — start clean at price.
+      console.warn(`[dxfeed] live-bar jump ${symbol}: ${open.close} → ${price} (reset bar)`);
+    }
     bars.push({ time: minute, open: price, high: price, low: price, close: price, volume: Number.isFinite(size) ? size : 0 });
     if (bars.length > LIVE_BAR_CAP) bars.splice(0, bars.length - LIVE_BAR_CAP);
     this.liveBarsDirty = true;
@@ -820,16 +880,25 @@ export class DxFeedProvider extends BaseProvider {
     if (ask > 0) st.ask = ask;
     if (st.bid > 0 && st.ask > 0) {
       const mid = (st.bid + st.ask) / 2;
-      // ALWAYS advance the mark from BBO. Thin products (NQ/YM/GC on this feed)
-      // often quote continuously but trade rarely — updating price only on Trade
-      // froze headers/charts while ES (busy prints) still looked live.
+      // Prefer Trade marks for live bars when we have them — quote mid from a
+      // second contract was stretching every candle. Still update the header mark.
       const first = !st.havePrice;
-      st.price = mid;
-      st.havePrice = true;
-      if (first) console.log(`[dxfeed] first quote ${symbol} mid @ ${mid}`);
-      if (st.high) st.high = Math.max(st.high, mid);
-      if (st.low) st.low = Math.min(st.low, mid);
-      this.recordLiveBar(symbol, mid, 0);
+      const inst = getInstrument(symbol);
+      const tick = inst?.tickSize ?? 0.25;
+      const maxJump = tick * LIVE_BAR_MAX_RANGE_TICKS;
+      const jump = st.havePrice && Math.abs(mid - st.price) > maxJump;
+      if (!jump) {
+        st.price = mid;
+        st.havePrice = true;
+        if (first) console.log(`[dxfeed] first quote ${symbol} mid @ ${mid}`);
+        if (st.high) st.high = Math.max(st.high, mid);
+        if (st.low) st.low = Math.min(st.low, mid);
+        if (!st.haveTrade) this.recordLiveBar(symbol, mid, 0);
+      } else if (!st.haveTrade) {
+        // No trades yet and mid disagrees with last — still advance carefully.
+        st.price = mid;
+        st.havePrice = true;
+      }
     }
     this.emitQuote(symbol, st, 0);
   }
@@ -840,10 +909,10 @@ export class DxFeedProvider extends BaseProvider {
     st.high = num(e.dayHighPrice) || st.high;
     st.low = num(e.dayLowPrice) || st.low;
     st.prevClose = num(e.prevDayClosePrice) || st.prevClose;
-    // Never leave price stuck on simBase while Summary has live session levels —
-    // that produces fake 24h % moves (seed price vs real prevClose) and a blank chart.
+    // Seed mark from day open / prior close — NEVER dayHigh/dayLow (that painted
+    // a single print at the session extreme and bloated the first live bar).
     if (!st.havePrice) {
-      const px = st.high || st.dayOpen || st.prevClose;
+      const px = st.dayOpen || st.prevClose;
       if (px > 0) {
         st.price = px;
         st.havePrice = true;
@@ -852,6 +921,18 @@ export class DxFeedProvider extends BaseProvider {
       }
     }
     this.emitQuote(symbol, st, 0);
+  }
+
+  /** Drop bars whose wick spans an impossible 1m range (corrupt dual-contract data). */
+  private sanitizeLiveBars(symbol: string, bars: Candle[]): Candle[] {
+    const inst = getInstrument(symbol);
+    const tick = inst?.tickSize ?? 0.25;
+    const maxRange = tick * LIVE_BAR_MAX_RANGE_TICKS;
+    return bars.filter((b) => {
+      if (!b || !(b.close > 0)) return false;
+      const span = (b.high ?? b.close) - (b.low ?? b.close);
+      return span <= maxRange;
+    });
   }
 
   /** Mark that this internal symbol (and micro twin) still has a live dxFeed stream. */
@@ -1044,7 +1125,15 @@ export class DxFeedProvider extends BaseProvider {
    *  micro chart never lags its mini just because only the parent accumulated bars.
    */
   private mergeLiveBars(symbol: string, snapshot: Candle[], resolutionSec: number, count: number): Candle[] {
-    const live = this.richestLiveBars(symbol);
+    const liveRaw = this.richestLiveBars(symbol);
+    const live = liveRaw?.length ? this.sanitizeLiveBars(symbol, liveRaw) : undefined;
+    // Persist cleanup so disk/cache stop serving stretched candles.
+    if (live && liveRaw && live.length < liveRaw.length) {
+      this.liveBars.set(symbol, live);
+      const twin = MICRO_OF[symbol] ?? PARENT_OF[symbol];
+      if (twin) this.liveBars.set(twin, live.map((c) => ({ ...c })));
+      this.liveBarsDirty = true;
+    }
     const pad = (!snapshot.length && resolutionSec >= 60) ? this.sessionPadBars(symbol, resolutionSec, count) : [];
     // The buffer is minute-grained, so it cannot build sub-minute resolutions.
     if (resolutionSec < 60) return snapshot.slice(-count);
