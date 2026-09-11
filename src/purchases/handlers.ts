@@ -7,9 +7,9 @@ import { getPurchaseStore } from "./store.js";
 import { extractPurchaseFields } from "./extract.js";
 import { getOnboardingProfileStore } from "./onboarding-profile.js";
 import { adminDeactivateSubscription } from "../trading/admin-repository.js";
+import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const ORDER_RE = /^[A-Za-z0-9_-]{4,64}$/;
 const COUNTRY_RE = /^[A-Z]{2}$/;
 
 type JsonFn = (res: ServerResponse, status: number, body: unknown) => void;
@@ -62,7 +62,7 @@ export async function handleClickFunnelsWebhook(
   const payload = (await readJson<unknown>(req)) ?? {};
   const fields = extractPurchaseFields(payload);
 
-  if (!fields.orderNumber || !ORDER_RE.test(fields.orderNumber)) {
+  if (!fields.orderNumber || !isValidOrderNumber(fields.orderNumber)) {
     json(res, 400, { error: "Missing or invalid order number in webhook payload." });
     return;
   }
@@ -72,7 +72,7 @@ export async function handleClickFunnelsWebhook(
   }
 
   const purchase = await getPurchaseStore().record({
-    orderNumber: fields.orderNumber,
+    orderNumber: normalizeOrderNumber(fields.orderNumber),
     email: fields.email,
     productName: fields.productName,
     rawPayload: payload,
@@ -94,12 +94,13 @@ export async function handlePurchaseValidate(
   res: ServerResponse,
   json: JsonFn,
 ): Promise<void> {
-  if (!ORDER_RE.test(orderNumber)) {
+  const normalized = normalizeOrderNumber(orderNumber);
+  if (!isValidOrderNumber(normalized)) {
     json(res, 400, { ok: false, reason: "invalid_order" });
     return;
   }
 
-  const purchase = await getPurchaseStore().findByOrderNumber(orderNumber);
+  const purchase = await getPurchaseStore().findByOrderNumber(normalized);
   if (!purchase) {
     json(res, 404, { ok: false, reason: "not_found" });
     return;
@@ -131,7 +132,7 @@ export async function handleOnboardingComplete(
 ): Promise<void> {
   const body = (await readJson<OnboardingCompleteBody>(req)) ?? {};
 
-  const orderNumber = body.orderNumber?.trim() ?? "";
+  const orderNumber = normalizeOrderNumber(body.orderNumber?.trim() ?? "");
   const email = body.email?.trim().toLowerCase() ?? "";
   const password = body.password ?? "";
   const firstName = body.firstName?.trim() ?? "";
@@ -146,7 +147,7 @@ export async function handleOnboardingComplete(
   const idDocument = body.idDocument ?? {};
   const addressDocument = body.addressDocument ?? {};
 
-  if (!ORDER_RE.test(orderNumber)) return json(res, 400, { error: "Invalid order number." });
+  if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
   if (!EMAIL_RE.test(email)) return json(res, 400, { error: "Invalid email." });
   if (name.length < 2) return json(res, 400, { error: "Please enter your full name." });
   if (password.length < 8) return json(res, 400, { error: "Password must be at least 8 characters." });

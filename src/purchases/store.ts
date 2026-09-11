@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import { getPool } from "../db/pool.js";
 import { useDatabase } from "../config.js";
 import type { Purchase, PurchaseStore, RecordPurchaseInput, PurchaseStatus } from "./types.js";
+import { normalizeOrderNumber } from "./order-number.js";
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
 function normalizeOrder(orderNumber: string): string {
-  return orderNumber.trim();
+  return normalizeOrderNumber(orderNumber);
 }
 
 /** In-memory store used when DATABASE_URL is unset (local / mock). */
@@ -36,7 +37,8 @@ class MemoryPurchaseStore implements PurchaseStore {
   }
 
   async findByOrderNumber(orderNumber: string): Promise<Purchase | null> {
-    return this.byOrder.get(normalizeOrder(orderNumber)) ?? null;
+    const key = normalizeOrder(orderNumber);
+    return this.byOrder.get(key) ?? this.byOrder.get(`#${key}`) ?? null;
   }
 
   async findByUserId(userId: string): Promise<Purchase | null> {
@@ -47,18 +49,21 @@ class MemoryPurchaseStore implements PurchaseStore {
   }
 
   async redeem(orderNumber: string, email: string, userId: string): Promise<Purchase | null> {
-    const purchase = this.byOrder.get(normalizeOrder(orderNumber));
+    const purchase = await this.findByOrderNumber(orderNumber);
     if (!purchase) return null;
     if (purchase.status !== "PAID") return null;
     if (purchase.email !== normalizeEmail(email)) return null;
 
+    const key = normalizeOrder(orderNumber);
     const redeemed: Purchase = {
       ...purchase,
+      orderNumber: key,
       status: "REDEEMED",
       userId,
       redeemedAt: new Date().toISOString(),
     };
-    this.byOrder.set(purchase.orderNumber, redeemed);
+    this.byOrder.delete(`#${key}`);
+    this.byOrder.set(key, redeemed);
     return redeemed;
   }
 
@@ -100,9 +105,12 @@ class PgPurchaseStore implements PurchaseStore {
 
   async findByOrderNumber(orderNumber: string): Promise<Purchase | null> {
     const pool = getPool();
-    const result = await pool.query(`SELECT * FROM "Purchase" WHERE "orderNumber" = $1 LIMIT 1`, [
-      normalizeOrder(orderNumber),
-    ]);
+    const key = normalizeOrder(orderNumber);
+    // Accept legacy rows that stored the ClickFunnels "#3327" form.
+    const result = await pool.query(
+      `SELECT * FROM "Purchase" WHERE "orderNumber" = $1 OR "orderNumber" = $2 LIMIT 1`,
+      [key, `#${key}`],
+    );
     return result.rows[0] ? mapRow(result.rows[0]) : null;
   }
 
@@ -117,17 +125,19 @@ class PgPurchaseStore implements PurchaseStore {
 
   async redeem(orderNumber: string, email: string, userId: string): Promise<Purchase | null> {
     const pool = getPool();
+    const key = normalizeOrder(orderNumber);
     const result = await pool.query(
       `UPDATE "Purchase"
        SET "status" = 'REDEEMED',
            "userId" = $3,
            "redeemedAt" = now(),
-           "updatedAt" = now()
-       WHERE "orderNumber" = $1
+           "updatedAt" = now(),
+           "orderNumber" = $4
+       WHERE ("orderNumber" = $1 OR "orderNumber" = $5)
          AND lower("email") = lower($2)
          AND "status" = 'PAID'
        RETURNING *`,
-      [normalizeOrder(orderNumber), normalizeEmail(email), userId],
+      [key, normalizeEmail(email), userId, key, `#${key}`],
     );
     return result.rows[0] ? mapRow(result.rows[0]) : null;
   }
