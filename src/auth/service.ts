@@ -1,6 +1,6 @@
 import { signToken, verifyToken, type Role } from "./jwt.js";
 import { verifyPassword } from "./password.js";
-import { ipsMatch, normalizeIp } from "./client-ip.js";
+import { normalizeIp } from "./client-ip.js";
 import { toPublicUser, type PublicUser, type UserStore } from "./users.js";
 import { getPurchaseStore } from "../purchases/store.js";
 import { useDatabase } from "../config.js";
@@ -14,7 +14,6 @@ export type LoginFailureReason =
   | "invalid_credentials"
   | "suspended"
   | "no_subscription"
-  | "ip_mismatch"
   | "session_active";
 
 export type LoginOutcome =
@@ -27,7 +26,7 @@ export class AuthService {
 
   /**
    * Authenticate with email/password.
-   * Traders are bound to the subscription IP and only one active session is allowed.
+   * Traders require an active purchase and only one concurrent session is allowed.
    */
   async login(email: string, password: string, clientIp?: string): Promise<LoginOutcome> {
     if (!email || !password) return { ok: false, reason: "invalid_credentials" };
@@ -37,9 +36,7 @@ export class AuthService {
     }
     if (user.status === "SUSPENDED") return { ok: false, reason: "suspended" };
 
-    const ip = normalizeIp(clientIp);
-
-    // Traders: require an active purchase (DB), bound-IP match, and no concurrent session.
+    // Traders: require an active purchase (DB) and no concurrent session.
     if (user.role === "TRADER") {
       const purchase = await getPurchaseStore().findByUserId(user.id);
       // Production traders are purchase-gated; in-memory demo traders have no purchase row.
@@ -51,20 +48,13 @@ export class AuthService {
         return { ok: false, reason: "no_subscription" };
       }
 
-      const bound = normalizeIp(user.boundIp ?? purchase?.ip ?? undefined);
-      if (bound) {
-        if (!ip || !ipsMatch(bound, ip)) {
-          return { ok: false, reason: "ip_mismatch" };
-        }
-      }
-
       if (user.activeSessionIp) {
         return { ok: false, reason: "session_active" };
       }
     }
 
-    const sessionIp = ip ?? "unknown";
-    const sv = await this.users.openSession(user.id, sessionIp);
+    const sessionMarker = normalizeIp(clientIp) ?? "active";
+    const sv = await this.users.openSession(user.id, sessionMarker);
     if (sv == null) return { ok: false, reason: "invalid_credentials" };
 
     const fresh = await this.users.findById(user.id);
@@ -99,7 +89,7 @@ export class AuthService {
 
   async register(input: { email: string; password: string; name: string; role?: Role }): Promise<AuthResult> {
     const user = await this.users.create(input);
-    // Registration does not open a session — user must log in (which binds IP).
+    // Registration does not open a session — user must log in.
     return {
       token: signToken(this.payload(user.id, user.email, user.role, user.sessionVersion)),
       user: toPublicUser(user),

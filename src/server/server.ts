@@ -200,7 +200,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
     return handlePurchaseValidate(orderNumber, res, json);
   }
   if (url.pathname === "/api/onboarding/complete" && req.method === "POST") {
-    return handleOnboardingComplete(req, res, opts.auth, opts.users, json, readJson);
+    return handleOnboardingComplete(req, res, opts.auth, json, readJson);
   }
 
   // --- Market-data connection (Model B / byo: each user's own Databento key) ---
@@ -436,12 +436,6 @@ async function handleLogin(req: IncomingMessage, res: ServerResponse, auth: Auth
       return json(res, 403, {
         error: "This account is already signed in. Sign out from the other session first.",
         code: "session_active",
-      });
-    }
-    if (outcome.reason === "ip_mismatch") {
-      return json(res, 403, {
-        error: "Login is only allowed from the IP address used at subscription.",
-        code: "ip_mismatch",
       });
     }
     if (outcome.reason === "no_subscription" || outcome.reason === "suspended") {

@@ -2,7 +2,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createEvaluationAccount } from "../trading/repository.js";
 import { useDatabase } from "../config.js";
 import type { AuthService } from "../auth/service.js";
-import { clientIp, normalizeIp } from "../auth/client-ip.js";
 import type { UserStore } from "../auth/users.js";
 import { getPurchaseStore } from "./store.js";
 import { extractPurchaseFields } from "./extract.js";
@@ -72,14 +71,10 @@ export async function handleClickFunnelsWebhook(
     return;
   }
 
-  // Prefer buyer IP from the CF payload; fall back to the relayed client IP header.
-  const subscribeIp = normalizeIp(fields.ip ?? clientIp(req) ?? undefined) ?? null;
-
   const purchase = await getPurchaseStore().record({
     orderNumber: fields.orderNumber,
     email: fields.email,
     productName: fields.productName,
-    ip: subscribeIp,
     rawPayload: payload,
   });
 
@@ -89,7 +84,6 @@ export async function handleClickFunnelsWebhook(
       orderNumber: purchase.orderNumber,
       email: purchase.email,
       status: purchase.status,
-      ip: purchase.ip,
     },
   });
 }
@@ -132,12 +126,10 @@ export async function handleOnboardingComplete(
   req: IncomingMessage,
   res: ServerResponse,
   auth: AuthService,
-  users: UserStore,
   json: JsonFn,
   readJson: ReadJsonFn,
 ): Promise<void> {
   const body = (await readJson<OnboardingCompleteBody>(req)) ?? {};
-  const onboardingIp = normalizeIp(clientIp(req) ?? undefined) ?? null;
 
   const orderNumber = body.orderNumber?.trim() ?? "";
   const email = body.email?.trim().toLowerCase() ?? "";
@@ -212,16 +204,10 @@ export async function handleOnboardingComplete(
     return json(res, 500, { error: "Could not save onboarding profile." });
   }
 
-  // Prefer the real browser IP from onboarding; keep webhook IP if client IP is missing.
-  const bindIp = onboardingIp ?? purchase.ip;
-  const redeemed = await store.redeem(orderNumber, email, userId, bindIp);
+  const redeemed = await store.redeem(orderNumber, email, userId);
   if (!redeemed) {
     // Extremely rare race: order burned between check and redeem.
     return json(res, 409, { error: "This purchase has already been used." });
-  }
-
-  if (bindIp) {
-    await users.setBoundIp(userId, bindIp);
   }
 
   if (useDatabase) {

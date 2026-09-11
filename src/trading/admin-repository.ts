@@ -588,7 +588,6 @@ export async function adminDeactivateSubscription(
     const u = await client.query(
       `UPDATE "User"
        SET "status" = 'SUSPENDED',
-           "boundIp" = NULL,
            "activeSessionIp" = NULL,
            "sessionVersion" = COALESCE("sessionVersion", 0) + 1,
            "updatedAt" = now()

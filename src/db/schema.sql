@@ -36,8 +36,7 @@ CREATE INDEX IF NOT EXISTS "User_role_status_idx" ON "User" ("role","status");
 -- at rest (AES-256-GCM via MARKET_DATA_ENC_KEY). NULL = not connected.
 ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "databentoKeyEnc" text;
 
--- Subscription IP bind + single-session lock (prevent concurrent logins).
-ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "boundIp" text;
+-- Subscription single-session lock (prevent concurrent logins).
 ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "activeSessionIp" text;
 ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "sessionVersion" integer NOT NULL DEFAULT 0;
 
@@ -443,9 +442,6 @@ CREATE TABLE IF NOT EXISTS "Purchase" (
 );
 CREATE INDEX IF NOT EXISTS "Purchase_email_idx" ON "Purchase" (lower("email"));
 CREATE INDEX IF NOT EXISTS "Purchase_status_idx" ON "Purchase" ("status");
-
--- Buyer IP captured at subscribe (webhook payload and/or onboarding client IP).
-ALTER TABLE "Purchase" ADD COLUMN IF NOT EXISTS "ip" text;
 CREATE INDEX IF NOT EXISTS "Purchase_userId_idx" ON "Purchase" ("userId");
 
 -- Purchase-gated registration profile + KYC document metadata (files on disk).

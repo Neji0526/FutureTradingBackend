@@ -10,8 +10,6 @@ export interface User {
   name: string;
   role: Role;
   status: UserStatus;
-  /** IP recorded at subscribe — required match at login for traders. */
-  boundIp: string | null;
   /** Set while a session is active; second login is rejected until logout. */
   activeSessionIp: string | null;
   /** Bumped on login / logout / deactivate so old JWTs stop working. */
@@ -38,16 +36,14 @@ export interface UserStore {
   create(input: { email: string; password: string; name: string; role?: Role }): Promise<User>;
   /** Set a new password (plaintext; hashed by the store). Returns false if the user is unknown. */
   updatePassword(id: string, newPassword: string): Promise<boolean>;
-  /** Bind the subscription IP used for login location checks. */
-  setBoundIp(id: string, ip: string | null): Promise<boolean>;
   /**
    * Open a session: set activeSessionIp and bump sessionVersion.
    * Returns the new sessionVersion, or null if the user is missing.
    */
-  openSession(id: string, ip: string): Promise<number | null>;
+  openSession(id: string, marker: string): Promise<number | null>;
   /** Clear activeSessionIp and bump sessionVersion (logout / kick). */
   clearSession(id: string): Promise<boolean>;
-  /** Suspend + wipe session bind fields (subscription deactivation). */
+  /** Suspend + wipe session fields (subscription deactivation). */
   deactivateUser(id: string): Promise<boolean>;
 }
 
@@ -70,7 +66,6 @@ export class MemoryUserStore implements UserStore {
       name,
       role,
       status: "ACTIVE",
-      boundIp: null,
       activeSessionIp: null,
       sessionVersion: 0,
     };
@@ -96,7 +91,6 @@ export class MemoryUserStore implements UserStore {
       name: input.name,
       role: input.role ?? "TRADER",
       status: "ACTIVE",
-      boundIp: null,
       activeSessionIp: null,
       sessionVersion: 0,
     };
@@ -112,17 +106,10 @@ export class MemoryUserStore implements UserStore {
     return true;
   }
 
-  async setBoundIp(id: string, ip: string | null): Promise<boolean> {
-    const user = this.byId.get(id);
-    if (!user) return false;
-    user.boundIp = ip;
-    return true;
-  }
-
-  async openSession(id: string, ip: string): Promise<number | null> {
+  async openSession(id: string, marker: string): Promise<number | null> {
     const user = this.byId.get(id);
     if (!user) return null;
-    user.activeSessionIp = ip;
+    user.activeSessionIp = marker;
     user.sessionVersion += 1;
     return user.sessionVersion;
   }
@@ -139,7 +126,6 @@ export class MemoryUserStore implements UserStore {
     const user = this.byId.get(id);
     if (!user || user.role !== "TRADER") return false;
     user.status = "SUSPENDED";
-    user.boundIp = null;
     user.activeSessionIp = null;
     user.sessionVersion += 1;
     return true;

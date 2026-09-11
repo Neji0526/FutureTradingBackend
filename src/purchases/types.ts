@@ -7,8 +7,6 @@ export interface Purchase {
   email: string;
   status: PurchaseStatus;
   productName: string | null;
-  /** Buyer IP captured at subscribe / refined at onboarding. */
-  ip: string | null;
   rawPayload: unknown;
   userId: string | null;
   createdAt: string;
@@ -19,7 +17,6 @@ export interface RecordPurchaseInput {
   orderNumber: string;
   email: string;
   productName?: string | null;
-  ip?: string | null;
   rawPayload?: unknown;
 }
 
@@ -29,7 +26,7 @@ export interface PurchaseStore {
   findByOrderNumber(orderNumber: string): Promise<Purchase | null>;
   findByUserId(userId: string): Promise<Purchase | null>;
   /** Mark PAID → REDEEMED and attach userId. Returns null if missing / not PAID / email mismatch. */
-  redeem(orderNumber: string, email: string, userId: string, ip?: string | null): Promise<Purchase | null>;
+  redeem(orderNumber: string, email: string, userId: string): Promise<Purchase | null>;
   /** Hard-delete all purchases for a user (subscription deactivation). */
   deleteByUserId(userId: string): Promise<number>;
 }

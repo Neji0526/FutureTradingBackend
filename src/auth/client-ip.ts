@@ -2,7 +2,7 @@ import type { IncomingMessage } from "node:http";
 
 /**
  * Best-effort client IP from proxy headers or the socket.
- * Prefer the first x-forwarded-for hop (set by reverse proxies / Next relays).
+ * Used for audit logs (e.g. login ActivityLog), not for access control.
  */
 export function clientIp(req: IncomingMessage): string | undefined {
   const fwd = req.headers["x-forwarded-for"];
@@ -20,20 +20,4 @@ export function normalizeIp(ip: string | null | undefined): string | undefined {
   if (!trimmed) return undefined;
   if (trimmed.startsWith("::ffff:")) return trimmed.slice(7);
   return trimmed;
-}
-
-/** True when both IPs are present and equal after normalization. */
-export function ipsMatch(a: string | null | undefined, b: string | null | undefined): boolean {
-  const left = canonicalizeIp(a);
-  const right = canonicalizeIp(b);
-  if (!left || !right) return false;
-  return left === right;
-}
-
-function canonicalizeIp(ip: string | null | undefined): string | undefined {
-  const n = normalizeIp(ip ?? undefined);
-  if (!n) return undefined;
-  // Treat common loopback forms as the same host (local / docker).
-  if (n === "::1" || n === "0:0:0:0:0:0:0:1" || n === "127.0.0.1") return "loopback";
-  return n;
 }
