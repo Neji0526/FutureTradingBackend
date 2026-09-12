@@ -73,6 +73,8 @@ export interface NewSubscriptionInput {
   dataFeedProducts: DataFeedProduct[];
   platform: Platform;
   enabled?: boolean;
+  /** When true, Volumetrica re-opens market-data agreement onboarding for the user. */
+  forceUserOnboarding?: boolean;
 }
 
 export interface UserResult {

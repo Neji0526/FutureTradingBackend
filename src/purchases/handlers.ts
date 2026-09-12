@@ -263,9 +263,10 @@ export async function handleDxFeedAgreementReset(
       ok: true,
       required: true,
       reset: true,
-      agreementSigned: false,
-      agreementLink: null,
+      agreementSigned: result.agreementSigned,
+      agreementLink: result.agreementLink,
       clearedLocal: result.clearedLocal,
+      deletedSubscription: result.deletedSubscription,
       notes: result.notes,
     });
   } catch (err) {

@@ -21,6 +21,15 @@ export interface OnboardingProvisionInput {
   country: string;
 }
 
+export interface ResetOnboardingResult {
+  clearedLocal: number;
+  notes: string[];
+  deletedSubscription: boolean;
+  /** When Volumetrica would not delete, we force agreement re-sign on the existing sub. */
+  agreementLink: string | null;
+  agreementSigned: boolean;
+}
+
 /**
  * Provision Volumetrica identity via DXFEED_API_KEY so the trader can sign the
  * market-data agreement during onboarding. Keyed by orderNumber (user may not
@@ -37,7 +46,6 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     return (await refreshAgreementStatus(input.orderNumber)) ?? existing;
   }
 
-  // Same email already provisioned on another/partial row — reuse instead of NewSubscription.
   const recovered = await adoptExistingSubscriptionForOrder(input.orderNumber, email);
   if (recovered?.dxSubscriptionId) {
     return (await refreshAgreementStatus(input.orderNumber)) ?? recovered;
@@ -79,6 +87,16 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     await upsertDxFeedLink(link);
   }
 
+  // Remote already has a sub (local id missing) — recover via GetSubscriptionStatus(userId).
+  if (!link.dxSubscriptionId) {
+    const remote = await fetchRemoteSubscription(link.dxUserId);
+    if (remote?.subscriptionId) {
+      applyRemoteSubscription(link, remote);
+      await upsertDxFeedLink(link);
+      return link;
+    }
+  }
+
   if (!link.dxAccountId) {
     const acct = await propfirm.createTradingAccount({
       userId: link.dxUserId,
@@ -110,6 +128,12 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
       await upsertDxFeedLink(link);
     } catch (err) {
       if (err instanceof DxFeedApiError && /already has a subscription/i.test(err.message)) {
+        const remote = await fetchRemoteSubscription(link.dxUserId);
+        if (remote?.subscriptionId) {
+          applyRemoteSubscription(link, remote);
+          await upsertDxFeedLink(link);
+          return link;
+        }
         const again = await adoptExistingSubscriptionForOrder(input.orderNumber, email, link.dxUserId);
         if (again?.dxSubscriptionId) {
           return (await refreshAgreementStatus(input.orderNumber)) ?? again;
@@ -123,14 +147,15 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
 }
 
 /**
- * Clear Volumetrica subscription/accounts for this purchase email and local
- * DxFeedAccount rows, so the same PAID order can Prepare + sign again
- * (no repurchase).
+ * Clear or re-open Volumetrica subscription for this PAID purchase email so the
+ * trader can sign again without repurchase.
+ *
+ * Why the old reset looked like a no-op: local DxFeedAccount often had no
+ * dxSubscriptionId (NewSubscription succeeded on Volumetrica but never stored),
+ * so deactivate/delete never ran. We now resolve the id via
+ * GetSubscriptionStatus(userId) per Propfirm swagger.
  */
-export async function resetForOnboarding(input: OnboardingProvisionInput): Promise<{
-  clearedLocal: number;
-  notes: string[];
-}> {
+export async function resetForOnboarding(input: OnboardingProvisionInput): Promise<ResetOnboardingResult> {
   if (!dxfeedProvisionReady) {
     throw new Error("dxFeed provisioning is not configured (set DXFEED_API_KEY).");
   }
@@ -149,7 +174,6 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
     links.map((l) => l.dxAccountId).filter((id): id is string => Boolean(id)),
   );
 
-  // Resolve dx user via upsert-by-email when local rows are incomplete.
   try {
     const user = await propfirm.newUser({
       firstName: input.firstName.trim() || "Trader",
@@ -165,7 +189,21 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
     notes.push(`NewUser lookup warn: ${(err as Error).message.slice(0, 160)}`);
   }
 
-  for (const subscriptionId of subscriptionIds) {
+  if (!dxUserId) {
+    throw new Error("Could not resolve Volumetrica user for this email; reset aborted.");
+  }
+
+  // Discover remote subscription id even when local DB never saved it.
+  let remote = await fetchRemoteSubscription(dxUserId);
+  if (remote?.subscriptionId) {
+    subscriptionIds.add(remote.subscriptionId);
+    notes.push(`discovered remote subscription ${remote.subscriptionId}`);
+  } else {
+    notes.push("no remote subscription found for user");
+  }
+
+  let deletedSubscription = false;
+  for (const subscriptionId of [...subscriptionIds]) {
     try {
       await propfirm.deactivateSubscription(subscriptionId);
       notes.push(`deactivated subscription ${subscriptionId}`);
@@ -175,20 +213,74 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
     try {
       await propfirm.deleteSubscription(subscriptionId);
       notes.push(`deleted subscription ${subscriptionId}`);
+      deletedSubscription = true;
     } catch (err) {
       notes.push(`delete subscription warn: ${(err as Error).message.slice(0, 160)}`);
     }
   }
 
-  if (dxUserId) {
+  remote = await fetchRemoteSubscription(dxUserId);
+
+  // If Volumetrica still has the sub, force re-sign on it (delete is optional per their docs).
+  if (remote?.subscriptionId) {
+    const p = config.dxfeed.provisioning;
     try {
-      const accounts = await propfirm.getUserAccounts(dxUserId);
-      for (const acct of accounts ?? []) {
-        if (acct.id) accountIds.add(acct.id);
+      await propfirm.updateSubscription(remote.subscriptionId, {
+        userId: dxUserId,
+        dataFeedProducts: p.dataFeedProducts as DataFeedProduct[],
+        platform: p.platform as Platform,
+        enabled: true,
+        forceUserOnboarding: true,
+      });
+      notes.push(`forced onboarding on subscription ${remote.subscriptionId}`);
+      try {
+        await propfirm.activeSubscription(remote.subscriptionId);
+        notes.push(`activated subscription ${remote.subscriptionId}`);
+      } catch (err) {
+        notes.push(`active subscription warn: ${(err as Error).message.slice(0, 160)}`);
       }
+      remote = (await fetchRemoteSubscription(dxUserId)) ?? remote;
+      deletedSubscription = false;
+
+      await deleteDxFeedLinksByEmail(email);
+      const link: DxFeedLinkInput = {
+        orderNumber: input.orderNumber,
+        userId: null,
+        email,
+        dxUserId,
+        dxAccountId: links.find((l) => l.dxAccountId)?.dxAccountId ?? null,
+        dxSubscriptionId: remote.subscriptionId ?? null,
+        accountStatus: null,
+        subscriptionStatus: remote.status ?? null,
+        agreementSigned: false,
+        agreementLink: remote.agreementLink ?? null,
+        platform: remote.platform ?? null,
+      };
+      await upsertDxFeedLink(link);
+      notes.push("stored refreshed agreement link for re-sign");
+
+      return {
+        clearedLocal: links.length,
+        notes,
+        deletedSubscription,
+        agreementLink: link.agreementLink,
+        agreementSigned: false,
+      };
     } catch (err) {
-      notes.push(`GetUserAccounts warn: ${(err as Error).message.slice(0, 160)}`);
+      throw new Error(
+        `Could not clear or re-open Volumetrica subscription ${remote.subscriptionId}: ${(err as Error).message}. ${notes.join(" | ")}`,
+      );
     }
+  }
+
+  // Subscription gone — remove trading accounts and local rows so Prepare can recreate.
+  try {
+    const accounts = await propfirm.getUserAccounts(dxUserId);
+    for (const acct of accounts ?? []) {
+      if (acct.id) accountIds.add(acct.id);
+    }
+  } catch (err) {
+    notes.push(`GetUserAccounts warn: ${(err as Error).message.slice(0, 160)}`);
   }
 
   for (const accountId of accountIds) {
@@ -198,31 +290,39 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
     } catch (err) {
       notes.push(`disable account warn: ${(err as Error).message.slice(0, 160)}`);
     }
-    if (dxUserId) {
-      try {
-        await propfirm.deleteTradingAccount(dxUserId, accountId);
-        notes.push(`deleted account ${accountId}`);
-      } catch (err) {
-        notes.push(`delete account warn: ${(err as Error).message.slice(0, 160)}`);
-      }
+    try {
+      await propfirm.deleteTradingAccount(dxUserId, accountId);
+      notes.push(`deleted account ${accountId}`);
+    } catch (err) {
+      notes.push(`delete account warn: ${(err as Error).message.slice(0, 160)}`);
     }
   }
 
   await deleteDxFeedLinksByEmail(email);
   notes.push(`cleared local DxFeedAccount rows for ${email}`);
 
-  return { clearedLocal: links.length, notes };
+  return {
+    clearedLocal: links.length,
+    notes,
+    deletedSubscription,
+    agreementLink: null,
+    agreementSigned: false,
+  };
 }
 
 /** Refresh agreementSigned from Propfirm when the webhook has not arrived yet. */
 export async function refreshAgreementStatus(orderNumber: string): Promise<DxFeedLink | null> {
   const link = await getDxFeedLinkByOrder(orderNumber);
-  if (!link?.dxUserId || !link.dxSubscriptionId || !dxfeedProvisionReady) return link;
+  if (!link?.dxUserId || !dxfeedProvisionReady) return link;
 
   try {
-    const raw = await propfirm.getSubscriptionStatus(link.dxUserId, link.dxSubscriptionId);
+    const raw = await propfirm.getSubscriptionStatus(
+      link.dxUserId,
+      link.dxSubscriptionId || undefined,
+    );
     const parsed = parseSubscriptionStatus(raw);
     if (parsed) {
+      if (parsed.subscriptionId) link.dxSubscriptionId = parsed.subscriptionId;
       if (parsed.status != null) link.subscriptionStatus = parsed.status;
       if (typeof parsed.agreementSigned === "boolean") link.agreementSigned = parsed.agreementSigned;
       if (parsed.agreementLink !== undefined) {
@@ -245,24 +345,74 @@ async function adoptExistingSubscriptionForOrder(
   const donor = candidates.find((l) => l.dxSubscriptionId)
     ?? candidates.find((l) => l.dxUserId);
   if (!donor?.dxSubscriptionId && !knownDxUserId && !donor?.dxUserId) return null;
-  if (!donor?.dxSubscriptionId) return null;
+
+  const dxUserId = donor?.dxUserId || knownDxUserId || "";
+  if (!dxUserId) return null;
+
+  let subscriptionId = donor?.dxSubscriptionId ?? null;
+  let agreementLink = donor?.agreementLink ?? null;
+  let agreementSigned = donor?.agreementSigned ?? false;
+  let subscriptionStatus = donor?.subscriptionStatus ?? null;
+  let platform = donor?.platform ?? null;
+
+  if (!subscriptionId) {
+    const remote = await fetchRemoteSubscription(dxUserId);
+    if (!remote?.subscriptionId) return null;
+    subscriptionId = remote.subscriptionId;
+    agreementLink = remote.agreementLink ?? agreementLink;
+    if (typeof remote.agreementSigned === "boolean") agreementSigned = remote.agreementSigned;
+    if (remote.status != null) subscriptionStatus = remote.status;
+    if (remote.platform != null) platform = remote.platform;
+  }
 
   const link: DxFeedLinkInput = {
     orderNumber,
     userId: null,
     email,
-    dxUserId: donor.dxUserId || knownDxUserId || "",
-    dxAccountId: donor.dxAccountId,
-    dxSubscriptionId: donor.dxSubscriptionId,
-    accountStatus: donor.accountStatus,
-    subscriptionStatus: donor.subscriptionStatus,
-    agreementSigned: donor.agreementSigned,
-    agreementLink: donor.agreementLink,
-    platform: donor.platform,
+    dxUserId,
+    dxAccountId: donor?.dxAccountId ?? null,
+    dxSubscriptionId: subscriptionId,
+    accountStatus: donor?.accountStatus ?? null,
+    subscriptionStatus,
+    agreementSigned,
+    agreementLink,
+    platform,
   };
-  if (!link.dxUserId) return null;
   await upsertDxFeedLink(link);
   return link;
+}
+
+async function fetchRemoteSubscription(dxUserId: string): Promise<{
+  subscriptionId?: string;
+  status?: number;
+  agreementSigned?: boolean;
+  agreementLink?: string | null;
+  platform?: number | null;
+} | null> {
+  try {
+    const raw = await propfirm.getSubscriptionStatus(dxUserId, null);
+    return parseSubscriptionStatus(raw);
+  } catch (err) {
+    console.warn("[dxfeed] fetchRemoteSubscription:", (err as Error).message.slice(0, 200));
+    return null;
+  }
+}
+
+function applyRemoteSubscription(
+  link: DxFeedLinkInput,
+  remote: {
+    subscriptionId?: string;
+    status?: number;
+    agreementSigned?: boolean;
+    agreementLink?: string | null;
+    platform?: number | null;
+  },
+): void {
+  if (remote.subscriptionId) link.dxSubscriptionId = remote.subscriptionId;
+  if (remote.status != null) link.subscriptionStatus = remote.status;
+  if (typeof remote.agreementSigned === "boolean") link.agreementSigned = remote.agreementSigned;
+  if (remote.agreementLink !== undefined) link.agreementLink = remote.agreementLink ?? link.agreementLink;
+  if (remote.platform != null) link.platform = remote.platform;
 }
 
 function uniqueLinks(links: DxFeedLink[]): DxFeedLink[] {
@@ -277,9 +427,11 @@ function uniqueLinks(links: DxFeedLink[]): DxFeedLink[] {
 }
 
 function parseSubscriptionStatus(raw: unknown): {
+  subscriptionId?: string;
   status?: number;
   agreementSigned?: boolean;
   agreementLink?: string | null;
+  platform?: number | null;
 } | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
@@ -287,16 +439,20 @@ function parseSubscriptionStatus(raw: unknown): {
     ? o.subscription
     : o) as Record<string, unknown>;
 
+  const subscriptionId = nested.subscriptionId ?? o.subscriptionId;
   const status = nested.status ?? nested.subscriptionStatus ?? o.status;
   const agreementSigned = nested.dxAgreementSigned ?? nested.agreementSigned ?? o.dxAgreementSigned;
   const agreementLink = (nested.dxAgreementLink ?? nested.agreementLink ?? o.dxAgreementLink) as
     | string
     | null
     | undefined;
+  const platform = nested.platform ?? o.platform;
 
   return {
+    subscriptionId: typeof subscriptionId === "string" && subscriptionId ? subscriptionId : undefined,
     status: typeof status === "number" ? status : undefined,
     agreementSigned: typeof agreementSigned === "boolean" ? agreementSigned : undefined,
     agreementLink,
+    platform: typeof platform === "number" ? platform : null,
   };
 }

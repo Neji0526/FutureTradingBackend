@@ -74,8 +74,17 @@ export class PropfirmClient {
     });
   }
 
-  getSubscriptionStatus(userId: string, subscriptionId: string): Promise<unknown> {
-    return this.call<unknown>("GetSubscriptionStatus", { query: { userId, subscriptionId } });
+  /**
+   * Fetch subscription by userId and/or subscriptionId.
+   * Swagger: userId alone returns that user's subscription (subscriptionId may be omitted).
+   */
+  getSubscriptionStatus(userId?: string | null, subscriptionId?: string | null): Promise<unknown> {
+    return this.call<unknown>("GetSubscriptionStatus", {
+      query: {
+        userId: userId || undefined,
+        subscriptionId: subscriptionId || undefined,
+      },
+    });
   }
 
   enableTradingAccount(accountId: string): Promise<unknown> {
@@ -96,6 +105,19 @@ export class PropfirmClient {
 
   deleteSubscription(subscriptionId: string): Promise<unknown> {
     return this.call<unknown>("DeleteSubscription", { query: { subscriptionId } });
+  }
+
+  /** Note: Volumetrica query param is misspelled `subcriptionId` in their API. */
+  updateSubscription(subscriptionId: string, body: NewSubscriptionInput): Promise<unknown> {
+    return this.call<unknown>("UpdateSubscription", {
+      method: "POST",
+      query: { subcriptionId: subscriptionId },
+      body,
+    });
+  }
+
+  activeSubscription(subscriptionId: string): Promise<unknown> {
+    return this.call<unknown>("ActiveSubscription", { query: { subscriptionId } });
   }
 }
 
