@@ -193,7 +193,19 @@ export async function handleDxFeedAgreementStart(
       ? err.message
       : (err as Error).message || "Could not start dxFeed agreement.";
     console.error("[onboarding] dxFeed provision failed:", message);
-    json(res, 502, { error: "Could not prepare the market data agreement. Try again." });
+
+    const alreadyExists = isDxFeedAlreadyExistsError(message);
+    json(res, alreadyExists ? 409 : 502, {
+      ok: false,
+      code: alreadyExists ? "already_exists" : "provision_failed",
+      error: alreadyExists
+        ? "A dxFeed / Volumetrica account or subscription already exists for this email."
+        : "Could not prepare the market data agreement.",
+      detail: message.slice(0, 500),
+      hint: alreadyExists
+        ? "Use the existing agreement for this email, or continue with Check status if you already signed. Contact support if you need the agreement link recovered."
+        : "Refresh the page and try Prepare agreement again. If it keeps failing, contact support with the details below.",
+    });
   }
 }
 
@@ -417,6 +429,17 @@ function asBool(v: unknown): boolean {
   if (typeof v === "boolean") return v;
   if (typeof v === "string") return v === "true" || v === "1" || v === "on";
   return false;
+}
+
+function isDxFeedAlreadyExistsError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("already has a subscription") ||
+    m.includes("already exists") ||
+    m.includes("user already") ||
+    m.includes("email already") ||
+    m.includes("duplicate")
+  );
 }
 
 function maskEmail(email: string): string {
