@@ -8,7 +8,11 @@ import { extractPurchaseFields } from "./extract.js";
 import { getOnboardingProfileStore } from "./onboarding-profile.js";
 import { adminDeactivateSubscription } from "../trading/admin-repository.js";
 import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
-import { provisionForOnboarding, refreshAgreementStatus } from "../dxfeed/provision.js";
+import {
+  provisionForOnboarding,
+  refreshAgreementStatus,
+  resetForOnboarding,
+} from "../dxfeed/provision.js";
 import { attachDxFeedUserId, getDxFeedLinkByOrder } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
@@ -203,8 +207,76 @@ export async function handleDxFeedAgreementStart(
         : "Could not prepare the market data agreement.",
       detail: message.slice(0, 500),
       hint: alreadyExists
-        ? "Use the existing agreement for this email, or continue with Check status if you already signed. Contact support if you need the agreement link recovered."
-        : "Refresh the page and try Prepare agreement again. If it keeps failing, contact support with the details below.",
+        ? "Use Reset & re-sign below to clear the old Volumetrica subscription for this paid order, then Prepare again. Or use Check status if you already signed."
+        : "Refresh the page and try Prepare agreement again. If it keeps failing, use Reset & re-sign, then Prepare again.",
+    });
+  }
+}
+
+/**
+ * Clear Volumetrica subscription/accounts + local DxFeedAccount for a still-PAID
+ * purchase so the trader can Prepare and sign again (no repurchase).
+ */
+export async function handleDxFeedAgreementReset(
+  req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+  readJson: ReadJsonFn,
+): Promise<void> {
+  if (!dxfeedProvisionReady) {
+    json(res, 200, { ok: true, required: false, reset: false });
+    return;
+  }
+
+  const body = (await readJson<DxFeedAgreementBody>(req)) ?? {};
+  const orderNumber = normalizeOrderNumber(body.orderNumber?.trim() ?? "");
+  const email = body.email?.trim().toLowerCase() ?? "";
+  const firstName = body.firstName?.trim() ?? "";
+  const lastName = body.lastName?.trim() ?? "";
+  const country = body.country?.trim().toUpperCase() ?? "";
+
+  if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
+  if (!EMAIL_RE.test(email)) return json(res, 400, { error: "Invalid email." });
+  if (firstName.length < 2 || lastName.length < 2) {
+    return json(res, 400, { error: "Please enter your full name first." });
+  }
+  if (!COUNTRY_RE.test(country)) return json(res, 400, { error: "Country is required." });
+
+  const purchase = await getPurchaseStore().findByOrderNumber(orderNumber);
+  if (!purchase) return json(res, 404, { error: "Purchase not found." });
+  if (purchase.status !== "PAID") {
+    return json(res, 409, { error: "This purchase has already been used." });
+  }
+  if (purchase.email !== email) {
+    return json(res, 403, { error: "Email must match the email used for the purchase." });
+  }
+
+  try {
+    const result = await resetForOnboarding({
+      orderNumber,
+      email,
+      firstName,
+      lastName,
+      country,
+    });
+    json(res, 200, {
+      ok: true,
+      required: true,
+      reset: true,
+      agreementSigned: false,
+      agreementLink: null,
+      clearedLocal: result.clearedLocal,
+      notes: result.notes,
+    });
+  } catch (err) {
+    const message = (err as Error).message || "Could not reset dxFeed agreement.";
+    console.error("[onboarding] dxFeed reset failed:", message);
+    json(res, 502, {
+      ok: false,
+      code: "reset_failed",
+      error: "Could not reset the market data agreement.",
+      detail: message.slice(0, 500),
+      hint: "Try again in a moment. If it keeps failing, contact support with the details below.",
     });
   }
 }

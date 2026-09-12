@@ -68,8 +68,34 @@ export class PropfirmClient {
     return this.call<SubscriptionResult>("NewSubscription", { method: "POST", body: input });
   }
 
+  getUserAccounts(userId: string): Promise<Array<{ id?: string; header?: string; enabled?: boolean }>> {
+    return this.call<Array<{ id?: string; header?: string; enabled?: boolean }>>("GetUserAccounts", {
+      query: { userId },
+    });
+  }
+
   getSubscriptionStatus(userId: string, subscriptionId: string): Promise<unknown> {
     return this.call<unknown>("GetSubscriptionStatus", { query: { userId, subscriptionId } });
+  }
+
+  enableTradingAccount(accountId: string): Promise<unknown> {
+    return this.call<unknown>("EnableTradingAccount", { query: { accountId } });
+  }
+
+  disableTradingAccount(accountId: string, reason = "Vault onboarding reset", forceClose = true): Promise<unknown> {
+    return this.call<unknown>("DisableTradingAccount", { query: { accountId, reason, forceClose } });
+  }
+
+  deleteTradingAccount(userId: string, accountId: string): Promise<unknown> {
+    return this.call<unknown>("DeleteTradingAccount", { query: { userId, accountId } });
+  }
+
+  deactivateSubscription(subscriptionId: string): Promise<unknown> {
+    return this.call<unknown>("DeactiveSubscription", { query: { subscriptionId } });
+  }
+
+  deleteSubscription(subscriptionId: string): Promise<unknown> {
+    return this.call<unknown>("DeleteSubscription", { query: { subscriptionId } });
   }
 }
 

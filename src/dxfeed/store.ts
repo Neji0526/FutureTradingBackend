@@ -49,6 +49,37 @@ export async function getDxFeedLinkByOrder(orderNumber: string): Promise<DxFeedL
   return rows[0] ? mapRow(rows[0]) : null;
 }
 
+export async function getDxFeedLinksByEmail(email: string): Promise<DxFeedLink[]> {
+  const normalized = email.trim().toLowerCase();
+  if (!useDatabase) {
+    return [...memory.values()].filter((l) => l.email.toLowerCase() === normalized);
+  }
+  const { rows } = await getPool().query(
+    `SELECT ${COLS} FROM "DxFeedAccount" WHERE lower("email") = lower($1) ORDER BY "updatedAt" DESC`,
+    [normalized],
+  );
+  return rows.map((r) => mapRow(r));
+}
+
+export async function deleteDxFeedLinkByOrder(orderNumber: string): Promise<void> {
+  if (!useDatabase) {
+    memory.delete(orderNumber);
+    return;
+  }
+  await getPool().query(`DELETE FROM "DxFeedAccount" WHERE "orderNumber" = $1`, [orderNumber]);
+}
+
+export async function deleteDxFeedLinksByEmail(email: string): Promise<void> {
+  const normalized = email.trim().toLowerCase();
+  if (!useDatabase) {
+    for (const [k, v] of memory) {
+      if (v.email.toLowerCase() === normalized) memory.delete(k);
+    }
+    return;
+  }
+  await getPool().query(`DELETE FROM "DxFeedAccount" WHERE lower("email") = lower($1)`, [normalized]);
+}
+
 export async function getLinkByDxUserId(dxUserId: string): Promise<DxFeedLink | null> {
   if (!useDatabase) {
     for (const link of memory.values()) {
