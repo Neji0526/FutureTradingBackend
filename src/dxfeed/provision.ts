@@ -30,6 +30,13 @@ export interface ResetOnboardingResult {
   agreementSigned: boolean;
 }
 
+/** After dxFeed sign, send the trader back to Vault onboarding for this order. */
+export function agreementRedirectUrl(orderNumber: string): string | undefined {
+  const base = config.dxfeed.provisioning.onboardingPublicUrl;
+  if (!base) return undefined;
+  return `${base.replace(/\/$/, "")}/onboarding?order=${encodeURIComponent(orderNumber)}&dxSigned=1`;
+}
+
 /**
  * Provision Volumetrica identity via DXFEED_API_KEY so the trader can sign the
  * market-data agreement during onboarding. Keyed by orderNumber (user may not
@@ -41,14 +48,23 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   }
 
   const email = input.email.trim().toLowerCase();
+  const redirectUrl = agreementRedirectUrl(input.orderNumber);
   const existing = await getDxFeedLinkByOrder(input.orderNumber);
   if (existing?.dxSubscriptionId) {
-    return (await refreshAgreementStatus(input.orderNumber)) ?? existing;
+    const refreshed = (await refreshAgreementStatus(input.orderNumber)) ?? existing;
+    if (!refreshed.agreementSigned) {
+      await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
+    }
+    return refreshed;
   }
 
   const recovered = await adoptExistingSubscriptionForOrder(input.orderNumber, email);
   if (recovered?.dxSubscriptionId) {
-    return (await refreshAgreementStatus(input.orderNumber)) ?? recovered;
+    const refreshed = (await refreshAgreementStatus(input.orderNumber)) ?? recovered;
+    if (!refreshed.agreementSigned) {
+      await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
+    }
+    return refreshed;
   }
 
   const p = config.dxfeed.provisioning;
@@ -93,6 +109,9 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     if (remote?.subscriptionId) {
       applyRemoteSubscription(link, remote);
       await upsertDxFeedLink(link);
+      if (!link.agreementSigned) {
+        await ensureAgreementRedirect(link, input.orderNumber, redirectUrl);
+      }
       return link;
     }
   }
@@ -119,6 +138,7 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
         dataFeedProducts: p.dataFeedProducts as DataFeedProduct[],
         platform: p.platform as Platform,
         enabled: true,
+        ...(redirectUrl ? { redirectUrl } : {}),
       });
       link.dxSubscriptionId = sub.subscriptionId;
       link.subscriptionStatus = sub.status;
@@ -132,11 +152,18 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
         if (remote?.subscriptionId) {
           applyRemoteSubscription(link, remote);
           await upsertDxFeedLink(link);
+          if (!link.agreementSigned) {
+            await ensureAgreementRedirect(link, input.orderNumber, redirectUrl);
+          }
           return link;
         }
         const again = await adoptExistingSubscriptionForOrder(input.orderNumber, email, link.dxUserId);
         if (again?.dxSubscriptionId) {
-          return (await refreshAgreementStatus(input.orderNumber)) ?? again;
+          const refreshed = (await refreshAgreementStatus(input.orderNumber)) ?? again;
+          if (!refreshed.agreementSigned) {
+            await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
+          }
+          return refreshed;
         }
       }
       throw err;
@@ -224,6 +251,7 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
   // If Volumetrica still has the sub, force re-sign on it (delete is optional per their docs).
   if (remote?.subscriptionId) {
     const p = config.dxfeed.provisioning;
+    const redirectUrl = agreementRedirectUrl(input.orderNumber);
     try {
       await propfirm.updateSubscription(remote.subscriptionId, {
         userId: dxUserId,
@@ -231,6 +259,7 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
         platform: p.platform as Platform,
         enabled: true,
         forceUserOnboarding: true,
+        ...(redirectUrl ? { redirectUrl } : {}),
       });
       notes.push(`forced onboarding on subscription ${remote.subscriptionId}`);
       try {
@@ -334,6 +363,27 @@ export async function refreshAgreementStatus(orderNumber: string): Promise<DxFee
     console.warn("[dxfeed] GetSubscriptionStatus failed:", (err as Error).message);
   }
   return link;
+}
+
+async function ensureAgreementRedirect(
+  link: DxFeedLinkInput,
+  orderNumber: string,
+  redirectUrl?: string,
+): Promise<void> {
+  const url = redirectUrl ?? agreementRedirectUrl(orderNumber);
+  if (!url || !link.dxSubscriptionId || !link.dxUserId) return;
+  const p = config.dxfeed.provisioning;
+  try {
+    await propfirm.updateSubscription(link.dxSubscriptionId, {
+      userId: link.dxUserId,
+      dataFeedProducts: p.dataFeedProducts as DataFeedProduct[],
+      platform: p.platform as Platform,
+      enabled: true,
+      redirectUrl: url,
+    });
+  } catch (err) {
+    console.warn("[dxfeed] ensureAgreementRedirect:", (err as Error).message.slice(0, 200));
+  }
 }
 
 async function adoptExistingSubscriptionForOrder(

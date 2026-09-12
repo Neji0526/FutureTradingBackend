@@ -75,6 +75,8 @@ export interface NewSubscriptionInput {
   enabled?: boolean;
   /** When true, Volumetrica re-opens market-data agreement onboarding for the user. */
   forceUserOnboarding?: boolean;
+  /** Where dxFeed redirects the browser after the trader signs the agreement. */
+  redirectUrl?: string;
 }
 
 export interface UserResult {

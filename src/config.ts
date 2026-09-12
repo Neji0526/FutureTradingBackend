@@ -71,6 +71,17 @@ export const config = {
         .filter((n) => Number.isFinite(n)),
       platform: num("DXFEED_PLATFORM", 0),
       country: process.env.DXFEED_DEFAULT_COUNTRY?.trim() || "US",
+      /**
+       * Public Vault origin for post-sign redirect back to onboarding
+       * (e.g. https://enterthevault.co). Falls back to CORS_ORIGIN when that
+       * is a real http(s) origin (not "*").
+       */
+      onboardingPublicUrl: (
+        process.env.ONBOARDING_PUBLIC_URL?.trim()
+        || (process.env.CORS_ORIGIN?.trim().startsWith("http")
+          ? process.env.CORS_ORIGIN.trim()
+          : "")
+      ).replace(/\/$/, ""),
     },
   },
 
