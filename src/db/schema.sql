@@ -466,3 +466,24 @@ CREATE TABLE IF NOT EXISTS "OnboardingProfile" (
   "createdAt"        timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS "OnboardingProfile_orderNumber_idx" ON "OnboardingProfile" ("orderNumber");
+
+-- Volumetrica/dxFeed identity for purchase-gated onboarding (data agreement).
+-- Keyed by orderNumber until the Vault user is created; userId is set on complete.
+CREATE TABLE IF NOT EXISTS "DxFeedAccount" (
+  "orderNumber"          text PRIMARY KEY,
+  "userId"               text UNIQUE REFERENCES "User"("id") ON DELETE SET NULL,
+  "email"                text NOT NULL,
+  "dxUserId"             text NOT NULL,
+  "dxAccountId"          text,
+  "dxSubscriptionId"     text,
+  "accountStatus"        integer,
+  "subscriptionStatus"   integer,
+  "agreementSigned"      boolean NOT NULL DEFAULT false,
+  "agreementLink"        text,
+  "platform"             integer,
+  "createdAt"            timestamptz NOT NULL DEFAULT now(),
+  "updatedAt"            timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS "DxFeedAccount_dxUserId_idx" ON "DxFeedAccount" ("dxUserId");
+CREATE INDEX IF NOT EXISTS "DxFeedAccount_dxAccountId_idx" ON "DxFeedAccount" ("dxAccountId");
+CREATE INDEX IF NOT EXISTS "DxFeedAccount_email_idx" ON "DxFeedAccount" (lower("email"));

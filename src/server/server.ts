@@ -59,6 +59,9 @@ import type { MarketDataProvider } from "../providers/provider.js";
 import {
   handleClickFunnelsWebhook,
   handleDeactivateSubscription,
+  handleDxFeedAgreementStart,
+  handleDxFeedAgreementStatus,
+  handleDxFeedWebhookHttp,
   handleOnboardingComplete,
   handlePurchaseValidate,
 } from "../purchases/handlers.js";
@@ -201,6 +204,15 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
   if (url.pathname === "/api/onboarding/complete" && req.method === "POST") {
     return handleOnboardingComplete(req, res, opts.auth, json, readJson);
+  }
+  if (url.pathname === "/api/onboarding/dxfeed-agreement" && req.method === "POST") {
+    return handleDxFeedAgreementStart(req, res, json, readJson);
+  }
+  if (url.pathname === "/api/onboarding/dxfeed-agreement/status" && req.method === "POST") {
+    return handleDxFeedAgreementStatus(req, res, json, readJson);
+  }
+  if (url.pathname === "/api/dxfeed/webhook" && req.method === "POST") {
+    return handleDxFeedWebhookHttp(req, res, json, readJson);
   }
 
   // --- Market-data connection (Model B / byo: each user's own Databento key) ---

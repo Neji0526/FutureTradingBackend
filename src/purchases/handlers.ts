@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createEvaluationAccount } from "../trading/repository.js";
-import { useDatabase } from "../config.js";
+import { dxfeedProvisionReady, useDatabase } from "../config.js";
 import type { AuthService } from "../auth/service.js";
 import type { UserStore } from "../auth/users.js";
 import { getPurchaseStore } from "./store.js";
@@ -8,6 +8,10 @@ import { extractPurchaseFields } from "./extract.js";
 import { getOnboardingProfileStore } from "./onboarding-profile.js";
 import { adminDeactivateSubscription } from "../trading/admin-repository.js";
 import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
+import { provisionForOnboarding, refreshAgreementStatus } from "../dxfeed/provision.js";
+import { attachDxFeedUserId, getDxFeedLinkByOrder } from "../dxfeed/store.js";
+import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
+import { DxFeedApiError } from "../dxfeed/propfirm.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const COUNTRY_RE = /^[A-Z]{2}$/;
@@ -36,6 +40,14 @@ interface OnboardingCompleteBody {
   addressType?: string;
   idDocument?: UploadedDocMeta;
   addressDocument?: UploadedDocMeta;
+}
+
+interface DxFeedAgreementBody {
+  orderNumber?: string;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+  country?: string;
 }
 
 /**
@@ -113,9 +125,140 @@ export async function handlePurchaseValidate(
   json(res, 200, {
     ok: true,
     orderNumber: purchase.orderNumber,
-    // Mask email slightly for the client — full match happens on redeem.
     emailHint: maskEmail(purchase.email),
   });
+}
+
+/**
+ * Start or resume Volumetrica provisioning (DXFEED_API_KEY) and return the
+ * market-data agreement link for the Documents step.
+ */
+export async function handleDxFeedAgreementStart(
+  req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+  readJson: ReadJsonFn,
+): Promise<void> {
+  if (!dxfeedProvisionReady) {
+    json(res, 200, {
+      ok: true,
+      required: false,
+      agreementSigned: true,
+      agreementLink: null,
+      note: "DXFEED_API_KEY not set — agreement step skipped.",
+    });
+    return;
+  }
+
+  const body = (await readJson<DxFeedAgreementBody>(req)) ?? {};
+  const orderNumber = normalizeOrderNumber(body.orderNumber?.trim() ?? "");
+  const email = body.email?.trim().toLowerCase() ?? "";
+  const firstName = body.firstName?.trim() ?? "";
+  const lastName = body.lastName?.trim() ?? "";
+  const country = body.country?.trim().toUpperCase() ?? "";
+
+  if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
+  if (!EMAIL_RE.test(email)) return json(res, 400, { error: "Invalid email." });
+  if (firstName.length < 2 || lastName.length < 2) {
+    return json(res, 400, { error: "Please enter your full name first." });
+  }
+  if (!COUNTRY_RE.test(country)) return json(res, 400, { error: "Country is required." });
+
+  const purchase = await getPurchaseStore().findByOrderNumber(orderNumber);
+  if (!purchase) return json(res, 404, { error: "Purchase not found." });
+  if (purchase.status !== "PAID") {
+    return json(res, 409, { error: "This purchase has already been used." });
+  }
+  if (purchase.email !== email) {
+    return json(res, 403, { error: "Email must match the email used for the purchase." });
+  }
+
+  try {
+    const link = await provisionForOnboarding({
+      orderNumber,
+      email,
+      firstName,
+      lastName,
+      country,
+    });
+    json(res, 200, {
+      ok: true,
+      required: true,
+      agreementSigned: link.agreementSigned,
+      agreementLink: link.agreementLink,
+      subscriptionStatus: link.subscriptionStatus,
+    });
+  } catch (err) {
+    const message = err instanceof DxFeedApiError
+      ? err.message
+      : (err as Error).message || "Could not start dxFeed agreement.";
+    console.error("[onboarding] dxFeed provision failed:", message);
+    json(res, 502, { error: "Could not prepare the market data agreement. Try again." });
+  }
+}
+
+/** Poll / refresh whether the trader has signed the Volumetrica data agreement. */
+export async function handleDxFeedAgreementStatus(
+  req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+  readJson: ReadJsonFn,
+): Promise<void> {
+  if (!dxfeedProvisionReady) {
+    json(res, 200, {
+      ok: true,
+      required: false,
+      agreementSigned: true,
+      agreementLink: null,
+    });
+    return;
+  }
+
+  const body = (await readJson<{ orderNumber?: string; email?: string }>(req)) ?? {};
+  const orderNumber = normalizeOrderNumber(body.orderNumber?.trim() ?? "");
+  const email = body.email?.trim().toLowerCase() ?? "";
+
+  if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
+
+  const purchase = await getPurchaseStore().findByOrderNumber(orderNumber);
+  if (!purchase) return json(res, 404, { error: "Purchase not found." });
+  if (email && purchase.email !== email) {
+    return json(res, 403, { error: "Email must match the email used for the purchase." });
+  }
+
+  const link = await refreshAgreementStatus(orderNumber);
+  if (!link) {
+    json(res, 200, {
+      ok: true,
+      required: true,
+      agreementSigned: false,
+      agreementLink: null,
+      ready: false,
+    });
+    return;
+  }
+
+  json(res, 200, {
+    ok: true,
+    required: true,
+    agreementSigned: link.agreementSigned,
+    agreementLink: link.agreementLink,
+    subscriptionStatus: link.subscriptionStatus,
+    ready: true,
+  });
+}
+
+export async function handleDxFeedWebhookHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+  readJson: ReadJsonFn,
+): Promise<void> {
+  const apiKeyHeader = req.headers["x-api-key"];
+  const apiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+  const body = await readJson<unknown>(req);
+  const result = await handleDxFeedWebhook(apiKey, body);
+  json(res, result.status, { ok: result.status === 200, note: result.note });
 }
 
 /**
@@ -169,6 +312,21 @@ export async function handleOnboardingComplete(
     });
   }
 
+  if (dxfeedProvisionReady) {
+    const refreshed = await refreshAgreementStatus(orderNumber);
+    const link = refreshed ?? (await getDxFeedLinkByOrder(orderNumber));
+    if (!link?.dxSubscriptionId) {
+      return json(res, 400, {
+        error: "Complete the market data agreement in Documents before finishing.",
+      });
+    }
+    if (!link.agreementSigned) {
+      return json(res, 400, {
+        error: "You must sign the dxFeed market data agreement before finishing.",
+      });
+    }
+  }
+
   let userId: string;
   try {
     const result = await auth.register({ email, password, name });
@@ -207,8 +365,15 @@ export async function handleOnboardingComplete(
 
   const redeemed = await store.redeem(orderNumber, email, userId);
   if (!redeemed) {
-    // Extremely rare race: order burned between check and redeem.
     return json(res, 409, { error: "This purchase has already been used." });
+  }
+
+  if (dxfeedProvisionReady) {
+    try {
+      await attachDxFeedUserId(orderNumber, userId);
+    } catch (e) {
+      console.error("[onboarding] dxFeed userId attach failed:", (e as Error).message);
+    }
   }
 
   if (useDatabase) {
@@ -242,7 +407,6 @@ export async function handleDeactivateSubscription(
     return { ok: true, purchasesRemoved: result.purchasesRemoved };
   }
 
-  // Memory / mock path.
   const removed = await getPurchaseStore().deleteByUserId(userId);
   const ok = await users.deactivateUser(userId);
   if (!ok) return { ok: false, purchasesRemoved: removed, error: "trader not found" };

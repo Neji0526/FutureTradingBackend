@@ -42,6 +42,11 @@ export const config = {
     endpoint: process.env.DXFEED_ENDPOINT?.trim() || "wss://demo.dxfeed.com/market-data/dxlink-ws",
     token: process.env.DXFEED_TOKEN?.trim() ?? "",
 
+    /** Propfirm REST — per-trader NewUser / NewSubscription + data agreement. */
+    propfirmUrl: process.env.DXFEED_PROPFIRM_URL?.trim() || "https://dxfeed.volumetricaprop.com",
+    /** x-api-key for Propfirm REST + webhooks. Unset = onboarding agreement skipped. */
+    apiKey: process.env.DXFEED_API_KEY?.trim() ?? "",
+
     /** Volumetrica auth service — mints a real dataEndpoint + dataToken per the
      *  Admin Trading API's "AUTH REQUEST" (v2 path; v1 silently omits the market
      *  data fields even on success — confirmed against staging 2026-08-27). */
@@ -54,6 +59,18 @@ export const config = {
       // ones — 6 is what actually returns dataEndpoint/dataToken (confirmed live).
       apiVersion: num("DXFEED_AUTH_API_VERSION", 6),
       environment: num("DXFEED_AUTH_ENVIRONMENT", 1), // 0 = production, 1 = staging
+    },
+
+    /** Defaults when provisioning a trader during onboarding (data agreement). */
+    provisioning: {
+      balance: num("DXFEED_DEFAULT_BALANCE", 50_000),
+      ruleId: process.env.DXFEED_DEFAULT_RULE_ID?.trim() ?? "",
+      dataFeedProducts: (process.env.DXFEED_DATA_PRODUCTS?.trim() || "0")
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isFinite(n)),
+      platform: num("DXFEED_PLATFORM", 0),
+      country: process.env.DXFEED_DEFAULT_COUNTRY?.trim() || "US",
     },
   },
 
@@ -95,3 +112,6 @@ export const useDatabento = config.databento.apiKey.length > 0;
 
 /** Use PostgreSQL (pg) for persistence when a connection string is present. */
 export const useDatabase = config.databaseUrl.length > 0;
+
+/** Propfirm provisioning + data-agreement gate — only when DXFEED_API_KEY is set. */
+export const dxfeedProvisionReady = config.dxfeed.apiKey.length > 0;
