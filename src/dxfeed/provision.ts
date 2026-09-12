@@ -339,25 +339,45 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
   };
 }
 
-/** Refresh agreementSigned from Propfirm when the webhook has not arrived yet. */
+/** Refresh agreementSigned from Propfirm when the webhook has not arrived yet.
+ *  Persists into DxFeedAccount so onboarding UI can show Signed automatically.
+ *
+ *  Important: Propfirm GetSubscriptionStatus rejects combined query args —
+ *  pass userId OR subscriptionId, never both (Swagger: userId must be null
+ *  when subscriptionId is sent). Prefer userId so a stale local sub id cannot
+ *  block the signed flag sync.
+ */
 export async function refreshAgreementStatus(orderNumber: string): Promise<DxFeedLink | null> {
   const link = await getDxFeedLinkByOrder(orderNumber);
   if (!link?.dxUserId || !dxfeedProvisionReady) return link;
 
   try {
-    const raw = await propfirm.getSubscriptionStatus(
-      link.dxUserId,
-      link.dxSubscriptionId || undefined,
-    );
-    const parsed = parseSubscriptionStatus(raw);
+    // userId-only — same path Reset uses to discover remote signed state.
+    let raw = await propfirm.getSubscriptionStatus(link.dxUserId, null);
+    let parsed = parseSubscriptionStatus(raw);
+
+    // Fallback: subscriptionId alone if userId query returned nothing useful.
+    if (!parsed?.subscriptionId && link.dxSubscriptionId) {
+      raw = await propfirm.getSubscriptionStatus(null, link.dxSubscriptionId);
+      parsed = parseSubscriptionStatus(raw);
+    }
+
     if (parsed) {
+      const before = link.agreementSigned;
       if (parsed.subscriptionId) link.dxSubscriptionId = parsed.subscriptionId;
       if (parsed.status != null) link.subscriptionStatus = parsed.status;
-      if (typeof parsed.agreementSigned === "boolean") link.agreementSigned = parsed.agreementSigned;
+      if (typeof parsed.agreementSigned === "boolean") {
+        link.agreementSigned = parsed.agreementSigned;
+      }
       if (parsed.agreementLink !== undefined) {
         link.agreementLink = parsed.agreementLink ?? link.agreementLink;
       }
       await upsertDxFeedLink(link);
+      if (!before && link.agreementSigned) {
+        console.log(
+          `[dxfeed] order ${orderNumber} agreementSigned synced from Propfirm → true`,
+        );
+      }
     }
   } catch (err) {
     console.warn("[dxfeed] GetSubscriptionStatus failed:", (err as Error).message);
@@ -487,11 +507,22 @@ function parseSubscriptionStatus(raw: unknown): {
   const o = raw as Record<string, unknown>;
   const nested = (o.subscription && typeof o.subscription === "object"
     ? o.subscription
-    : o) as Record<string, unknown>;
+    : o.data && typeof o.data === "object"
+      ? o.data
+      : o) as Record<string, unknown>;
 
   const subscriptionId = nested.subscriptionId ?? o.subscriptionId;
   const status = nested.status ?? nested.subscriptionStatus ?? o.status;
-  const agreementSigned = nested.dxAgreementSigned ?? nested.agreementSigned ?? o.dxAgreementSigned;
+  const agreementSignedRaw =
+    nested.dxAgreementSigned ?? nested.agreementSigned ?? o.dxAgreementSigned ?? o.agreementSigned;
+  const agreementSigned =
+    typeof agreementSignedRaw === "boolean"
+      ? agreementSignedRaw
+      : agreementSignedRaw === 1 || agreementSignedRaw === "1" || agreementSignedRaw === "true"
+        ? true
+        : agreementSignedRaw === 0 || agreementSignedRaw === "0" || agreementSignedRaw === "false"
+          ? false
+          : undefined;
   const agreementLink = (nested.dxAgreementLink ?? nested.agreementLink ?? o.dxAgreementLink) as
     | string
     | null
@@ -501,7 +532,7 @@ function parseSubscriptionStatus(raw: unknown): {
   return {
     subscriptionId: typeof subscriptionId === "string" && subscriptionId ? subscriptionId : undefined,
     status: typeof status === "number" ? status : undefined,
-    agreementSigned: typeof agreementSigned === "boolean" ? agreementSigned : undefined,
+    agreementSigned,
     agreementLink,
     platform: typeof platform === "number" ? platform : null,
   };

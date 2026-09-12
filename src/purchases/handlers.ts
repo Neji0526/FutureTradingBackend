@@ -13,7 +13,7 @@ import {
   refreshAgreementStatus,
   resetForOnboarding,
 } from "../dxfeed/provision.js";
-import { attachDxFeedUserId, getDxFeedLinkByOrder } from "../dxfeed/store.js";
+import { attachDxFeedUserId, getDxFeedLinkByOrder, getDxFeedLinksByEmail, upsertDxFeedLink } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
 
@@ -311,7 +311,24 @@ export async function handleDxFeedAgreementStatus(
     return json(res, 403, { error: "Email must match the email used for the purchase." });
   }
 
-  const link = await refreshAgreementStatus(orderNumber);
+  // If this order has no local row yet, adopt any DxFeedAccount for the purchase email
+  // so GetSubscriptionStatus can sync agreementSigned into this order's row.
+  let link = await getDxFeedLinkByOrder(orderNumber);
+  if (!link) {
+    const matchEmail = email || purchase.email;
+    const siblings = await getDxFeedLinksByEmail(matchEmail);
+    const donor = siblings.find((l) => l.dxUserId);
+    if (donor) {
+      await upsertDxFeedLink({
+        ...donor,
+        orderNumber,
+        email: matchEmail,
+        userId: donor.userId,
+      });
+    }
+  }
+
+  link = await refreshAgreementStatus(orderNumber);
   if (!link) {
     json(res, 200, {
       ok: true,

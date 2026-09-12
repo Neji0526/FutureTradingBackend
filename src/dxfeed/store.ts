@@ -94,6 +94,20 @@ export async function getLinkByDxUserId(dxUserId: string): Promise<DxFeedLink | 
   return rows[0] ? mapRow(rows[0]) : null;
 }
 
+export async function getLinkBySubscriptionId(dxSubscriptionId: string): Promise<DxFeedLink | null> {
+  if (!useDatabase) {
+    for (const link of memory.values()) {
+      if (link.dxSubscriptionId === dxSubscriptionId) return link;
+    }
+    return null;
+  }
+  const { rows } = await getPool().query(
+    `SELECT ${COLS} FROM "DxFeedAccount" WHERE "dxSubscriptionId" = $1`,
+    [dxSubscriptionId],
+  );
+  return rows[0] ? mapRow(rows[0]) : null;
+}
+
 export async function getLinkByAccountId(dxAccountId: string): Promise<DxFeedLink | null> {
   if (!useDatabase) {
     for (const link of memory.values()) {

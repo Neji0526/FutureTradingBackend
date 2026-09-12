@@ -1,5 +1,10 @@
 import { config } from "../config.js";
-import { getLinkByAccountId, getLinkByDxUserId, upsertDxFeedLink } from "./store.js";
+import {
+  getLinkByAccountId,
+  getLinkByDxUserId,
+  getLinkBySubscriptionId,
+  upsertDxFeedLink,
+} from "./store.js";
 import { AccountStatus } from "./types.js";
 
 export const NotificationCategory = {
@@ -64,20 +69,25 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
       return;
     }
     case NotificationCategory.SUBSCRIPTIONS: {
-      const uid = ev.userId ?? null;
-      if (!uid) return;
-      const link = await getLinkByDxUserId(uid);
-      if (!link) return;
       const sub = ev.subscription;
+      const uid = ev.userId ?? null;
+      const subId = sub?.subscriptionId ?? null;
+      const link =
+        (uid ? await getLinkByDxUserId(uid) : null)
+        ?? (subId ? await getLinkBySubscriptionId(subId) : null);
+      if (!link) return;
       if (sub) {
+        if (sub.subscriptionId) link.dxSubscriptionId = sub.subscriptionId;
         if (sub.status != null) link.subscriptionStatus = sub.status;
-        if (typeof sub.dxAgreementSigned === "boolean") link.agreementSigned = sub.dxAgreementSigned;
+        if (typeof sub.dxAgreementSigned === "boolean") {
+          link.agreementSigned = sub.dxAgreementSigned;
+        }
         if (sub.dxAgreementLink !== undefined) {
           link.agreementLink = sub.dxAgreementLink ?? link.agreementLink;
         }
         await upsertDxFeedLink(link);
         if (sub.dxAgreementSigned) {
-          console.log(`[dxfeed] user ${uid} SIGNED the data agreement (order ${link.orderNumber})`);
+          console.log(`[dxfeed] user ${link.dxUserId} SIGNED the data agreement (order ${link.orderNumber})`);
         }
       }
       return;
