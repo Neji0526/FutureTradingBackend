@@ -135,7 +135,7 @@ export async function handlePurchaseValidate(
 
 /**
  * Start or resume Volumetrica provisioning (DXFEED_API_KEY) and return the
- * market-data agreement link for the Documents step.
+ * market-data agreement link for the first onboarding step.
  */
 export async function handleDxFeedAgreementStart(
   req: IncomingMessage,
