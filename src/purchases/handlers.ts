@@ -16,11 +16,6 @@ import {
 import { attachDxFeedUserId, getDxFeedLinkByOrder, getDxFeedLinksByEmail, upsertDxFeedLink } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
-import { publicAgreementFields } from "../dxfeed/public-agreement.js";
-import {
-  consumeAgreementOpenTicket,
-  revokeAgreementOpenTickets,
-} from "../dxfeed/open-ticket.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const COUNTRY_RE = /^[A-Z]{2}$/;
@@ -139,8 +134,8 @@ export async function handlePurchaseValidate(
 }
 
 /**
- * Start or resume Volumetrica provisioning (DXFEED_API_KEY) and return a
- * one-time openTicket (never the raw dxFeed agreement URL).
+ * Start or resume Volumetrica provisioning (DXFEED_API_KEY) and return the
+ * market-data agreement link for the first onboarding step.
  */
 export async function handleDxFeedAgreementStart(
   req: IncomingMessage,
@@ -150,14 +145,10 @@ export async function handleDxFeedAgreementStart(
 ): Promise<void> {
   if (!dxfeedProvisionReady) {
     json(res, 200, {
-      ...publicAgreementFields({
-        orderNumber: "",
-        email: "",
-        agreementSigned: true,
-        agreementLink: null,
-        mintTicket: false,
-        required: false,
-      }),
+      ok: true,
+      required: false,
+      agreementSigned: true,
+      agreementLink: null,
       note: "DXFEED_API_KEY not set — agreement step skipped.",
     });
     return;
@@ -194,13 +185,13 @@ export async function handleDxFeedAgreementStart(
       lastName,
       country,
     });
-    json(res, 200, publicAgreementFields({
-      orderNumber,
-      email,
+    json(res, 200, {
+      ok: true,
+      required: true,
       agreementSigned: link.agreementSigned,
       agreementLink: link.agreementLink,
-      mintTicket: !link.agreementSigned,
-    }));
+      subscriptionStatus: link.subscriptionStatus,
+    });
   } catch (err) {
     const message = err instanceof DxFeedApiError
       ? err.message
@@ -261,7 +252,6 @@ export async function handleDxFeedAgreementReset(
   }
 
   try {
-    revokeAgreementOpenTickets(orderNumber);
     const result = await resetForOnboarding({
       orderNumber,
       email,
@@ -270,16 +260,14 @@ export async function handleDxFeedAgreementReset(
       country,
     });
     json(res, 200, {
-      ...publicAgreementFields({
-        orderNumber,
-        email,
-        agreementSigned: result.agreementSigned,
-        agreementLink: result.agreementLink,
-        mintTicket: !result.agreementSigned,
-      }),
+      ok: true,
+      required: true,
       reset: true,
+      agreementSigned: result.agreementSigned,
+      agreementLink: result.agreementLink,
       clearedLocal: result.clearedLocal,
       deletedSubscription: result.deletedSubscription,
+      notes: result.notes,
     });
   } catch (err) {
     const message = (err as Error).message || "Could not reset dxFeed agreement.";
@@ -294,9 +282,7 @@ export async function handleDxFeedAgreementReset(
   }
 }
 
-/** Poll / refresh whether the trader has signed the Volumetrica data agreement.
- *  Never returns the raw agreement URL or a new open ticket (status is not a
- *  channel for stealing the signing link). */
+/** Poll / refresh whether the trader has signed the Volumetrica data agreement. */
 export async function handleDxFeedAgreementStatus(
   req: IncomingMessage,
   res: ServerResponse,
@@ -304,14 +290,12 @@ export async function handleDxFeedAgreementStatus(
   readJson: ReadJsonFn,
 ): Promise<void> {
   if (!dxfeedProvisionReady) {
-    json(res, 200, publicAgreementFields({
-      orderNumber: "",
-      email: "",
+    json(res, 200, {
+      ok: true,
+      required: false,
       agreementSigned: true,
       agreementLink: null,
-      mintTicket: false,
-      required: false,
-    }));
+    });
     return;
   }
 
@@ -346,75 +330,24 @@ export async function handleDxFeedAgreementStatus(
 
   link = await refreshAgreementStatus(orderNumber);
   if (!link) {
-    json(res, 200, publicAgreementFields({
-      orderNumber,
-      email: email || purchase.email,
+    json(res, 200, {
+      ok: true,
+      required: true,
       agreementSigned: false,
       agreementLink: null,
-      mintTicket: false,
       ready: false,
-    }));
+    });
     return;
   }
 
-  json(res, 200, publicAgreementFields({
-    orderNumber,
-    email: email || purchase.email,
+  json(res, 200, {
+    ok: true,
+    required: true,
     agreementSigned: link.agreementSigned,
     agreementLink: link.agreementLink,
-    mintTicket: false,
+    subscriptionStatus: link.subscriptionStatus,
     ready: true,
-  }));
-}
-
-/**
- * Redeem a one-time openTicket → dxFeed agreement URL.
- * Ticket is burned on first successful (or mismatched) consume.
- */
-export async function handleDxFeedAgreementOpen(
-  req: IncomingMessage,
-  res: ServerResponse,
-  json: JsonFn,
-  readJson: ReadJsonFn,
-): Promise<void> {
-  if (!dxfeedProvisionReady) {
-    return json(res, 404, { error: "Agreement open is not available." });
-  }
-
-  const body = (await readJson<{ orderNumber?: string; email?: string; openTicket?: string }>(req)) ?? {};
-  const orderNumber = normalizeOrderNumber(body.orderNumber?.trim() ?? "");
-  const email = body.email?.trim().toLowerCase() ?? "";
-  const openTicket = body.openTicket?.trim() ?? "";
-
-  if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
-  if (!EMAIL_RE.test(email)) return json(res, 400, { error: "Invalid email." });
-  if (!openTicket) return json(res, 400, { error: "Missing open ticket." });
-
-  const purchase = await getPurchaseStore().findByOrderNumber(orderNumber);
-  if (!purchase) return json(res, 404, { error: "Purchase not found." });
-  if (purchase.status !== "PAID") {
-    return json(res, 409, { error: "This purchase has already been used." });
-  }
-  if (purchase.email !== email) {
-    return json(res, 403, { error: "Email must match the email used for the purchase." });
-  }
-
-  const consumed = consumeAgreementOpenTicket(openTicket, orderNumber, email);
-  if (!consumed.ok) {
-    const message =
-      consumed.reason === "expired"
-        ? "This signing link expired. Use Refresh link for a new one-time open."
-        : "This signing link was already used or is invalid. Use Refresh link for a new one-time open.";
-    return json(res, 410, {
-      ok: false,
-      code: "open_ticket_used",
-      error: message,
-      openOnce: true,
-    });
-  }
-
-  // Do not echo the ticket. Redirect target is returned once for this redeem.
-  json(res, 200, { ok: true, redirect: consumed.url, openOnce: true });
+  });
 }
 
 export async function handleDxFeedWebhookHttp(
