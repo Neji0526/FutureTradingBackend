@@ -400,6 +400,14 @@ export async function handleOnboardingComplete(
   if (!COUNTRY_RE.test(country)) return json(res, 400, { error: "Country is required." });
   if (!acceptTerms) return json(res, 400, { error: "You must accept the terms." });
   if (!acceptRisk) return json(res, 400, { error: "You must confirm the trading rules." });
+  if (!idType) return json(res, 400, { error: "Identity document type is required." });
+  if (!addressType) return json(res, 400, { error: "Proof of address type is required." });
+  if (!idDocument.fileName || !idDocument.storedPath) {
+    return json(res, 400, { error: "Identity document upload is required." });
+  }
+  if (!addressDocument.fileName || !addressDocument.storedPath) {
+    return json(res, 400, { error: "Proof of address upload is required." });
+  }
 
   const store = getPurchaseStore();
   const purchase = await store.findByOrderNumber(orderNumber);
