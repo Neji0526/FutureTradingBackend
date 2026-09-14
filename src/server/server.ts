@@ -62,7 +62,6 @@ import {
   handleDxFeedAgreementStart,
   handleDxFeedAgreementStatus,
   handleDxFeedAgreementReset,
-  handleDxFeedAgreementOpen,
   handleDxFeedWebhookHttp,
   handleOnboardingComplete,
   handlePurchaseValidate,
@@ -215,9 +214,6 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
   if (url.pathname === "/api/onboarding/dxfeed-agreement/reset" && req.method === "POST") {
     return handleDxFeedAgreementReset(req, res, json, readJson);
-  }
-  if (url.pathname === "/api/onboarding/dxfeed-agreement/open" && req.method === "POST") {
-    return handleDxFeedAgreementOpen(req, res, json, readJson);
   }
   if (url.pathname === "/api/dxfeed/webhook" && req.method === "POST") {
     return handleDxFeedWebhookHttp(req, res, json, readJson);
