@@ -23,13 +23,6 @@ const COUNTRY_RE = /^[A-Z]{2}$/;
 type JsonFn = (res: ServerResponse, status: number, body: unknown) => void;
 type ReadJsonFn = <T>(req: IncomingMessage) => Promise<T | null>;
 
-interface UploadedDocMeta {
-  fileName?: string;
-  storedPath?: string;
-  mimeType?: string;
-  size?: number;
-}
-
 interface OnboardingCompleteBody {
   orderNumber?: string;
   email?: string;
@@ -40,10 +33,6 @@ interface OnboardingCompleteBody {
   country?: string;
   acceptTerms?: boolean | string;
   acceptRisk?: boolean | string;
-  idType?: string;
-  addressType?: string;
-  idDocument?: UploadedDocMeta;
-  addressDocument?: UploadedDocMeta;
 }
 
 interface DxFeedAgreementBody {
@@ -365,8 +354,8 @@ export async function handleDxFeedWebhookHttp(
 
 /**
  * Complete onboarding / registration: email must match the purchase, then create
- * the user, store KYC profile + document paths, provision an evaluation account,
- * and burn the order (one account per purchase).
+ * the user, store the profile, provision an evaluation account, and burn the
+ * order (one account per purchase).
  */
 export async function handleOnboardingComplete(
   req: IncomingMessage,
@@ -387,10 +376,6 @@ export async function handleOnboardingComplete(
   const country = body.country?.trim().toUpperCase() ?? "";
   const acceptTerms = asBool(body.acceptTerms);
   const acceptRisk = asBool(body.acceptRisk);
-  const idType = body.idType?.trim() || "";
-  const addressType = body.addressType?.trim() || "";
-  const idDocument = body.idDocument ?? {};
-  const addressDocument = body.addressDocument ?? {};
 
   if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
   if (!EMAIL_RE.test(email)) return json(res, 400, { error: "Invalid email." });
@@ -419,7 +404,7 @@ export async function handleOnboardingComplete(
     const link = refreshed ?? (await getDxFeedLinkByOrder(orderNumber));
     if (!link?.dxSubscriptionId) {
       return json(res, 400, {
-        error: "Complete the market data agreement in Documents before finishing.",
+        error: "Complete the market data agreement before finishing.",
       });
     }
     if (!link.agreementSigned) {
@@ -449,16 +434,17 @@ export async function handleOnboardingComplete(
       country,
       acceptTerms,
       acceptRisk,
-      idType,
-      addressType,
-      idFileName: String(idDocument.fileName ?? ""),
-      idFilePath: String(idDocument.storedPath ?? ""),
-      idMimeType: String(idDocument.mimeType ?? ""),
-      idSize: Number(idDocument.size ?? 0),
-      addressFileName: String(addressDocument.fileName ?? ""),
-      addressFilePath: String(addressDocument.storedPath ?? ""),
-      addressMimeType: String(addressDocument.mimeType ?? ""),
-      addressSize: Number(addressDocument.size ?? 0),
+      // KYC uploads removed from onboarding — keep empty columns for schema compatibility.
+      idType: "",
+      addressType: "",
+      idFileName: "",
+      idFilePath: "",
+      idMimeType: "",
+      idSize: 0,
+      addressFileName: "",
+      addressFilePath: "",
+      addressMimeType: "",
+      addressSize: 0,
     });
   } catch (e) {
     console.error("[onboarding] profile save failed:", (e as Error).message);

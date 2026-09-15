@@ -85,6 +85,8 @@ export function startMarketLiveConsole(provider: MarketDataProvider): () => void
 /** Snapshot used by GET /api/market/live-state. */
 export function getMarketLiveState(): {
   provider: string;
+  /** True when MARKET_DATA_MODE is serving via the dxFeed provider. */
+  dxfeedConnected: boolean;
   at: string;
   marketOpen: boolean;
   exchanges: string[];
@@ -101,8 +103,10 @@ export function getMarketLiveState(): {
     }
   }
   const feed = provider?.getFeedStatus?.();
+  const providerName = provider?.name ?? "none";
   return {
-    provider: provider?.name ?? "none",
+    provider: providerName,
+    dxfeedConnected: providerName === "dxfeed",
     at: new Date().toISOString(),
     marketOpen: isMarketOpen(),
     exchanges: feed?.exchanges ?? [],
