@@ -61,6 +61,30 @@ export const config = {
       environment: num("DXFEED_AUTH_ENVIRONMENT", 1), // 0 = production, 1 = staging
     },
 
+    /**
+     * Map Volumetrica Trading Rule References → Vault RuleTemplate ids.
+     * JSON object, e.g. {"PRIME_50K_EVAL":"c1_50k","PRIME_50K_FUND":"f_50k"}
+     * Keys are matched case-insensitively after uppercase normalisation.
+     */
+    ruleMap: (() => {
+      const raw = process.env.DXFEED_RULE_MAP?.trim();
+      if (!raw) return {} as Record<string, string>;
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof v === "string" && v.trim()) {
+            out[k.trim().toUpperCase()] = v.trim();
+            out[k.trim()] = v.trim();
+          }
+        }
+        return out;
+      } catch {
+        console.warn("[config] DXFEED_RULE_MAP is not valid JSON — ignoring");
+        return {} as Record<string, string>;
+      }
+    })(),
+
     /** Defaults when provisioning a trader during onboarding (data agreement). */
     provisioning: {
       balance: num("DXFEED_DEFAULT_BALANCE", 50_000),

@@ -119,6 +119,21 @@ export class PropfirmClient {
   activeSubscription(subscriptionId: string): Promise<unknown> {
     return this.call<unknown>("ActiveSubscription", { query: { subscriptionId } });
   }
+
+  /**
+   * Best-effort list of org Trading Rules from Volumetrica Admin.
+   * Action name varies by Propsite build — try GetTradingRules then GetAccountRules.
+   */
+  async getTradingRules(): Promise<unknown> {
+    try {
+      return await this.call<unknown>("GetTradingRules");
+    } catch (err) {
+      if (err instanceof DxFeedApiError && (err.status === 404 || err.status === 400)) {
+        return this.call<unknown>("GetAccountRules");
+      }
+      throw err;
+    }
+  }
 }
 
 export const propfirm = new PropfirmClient();

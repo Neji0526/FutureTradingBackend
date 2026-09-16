@@ -6,9 +6,21 @@ import {
   upsertDxFeedLink,
 } from "./store.js";
 import { AccountStatus } from "./types.js";
+import {
+  dxFeedApiKeyOk,
+  extractTradingRulesFromBody,
+  syncTradingRulesFromBody,
+} from "./trading-rules-sync.js";
 
 export const NotificationCategory = {
-  ACCOUNTS: 0, OVERNIGHT: 1, SUBSCRIPTIONS: 2, TRADE_REPORT: 3, PORTFOLIO: 4, ORG_USER: 5,
+  ACCOUNTS: 0,
+  OVERNIGHT: 1,
+  SUBSCRIPTIONS: 2,
+  TRADE_REPORT: 3,
+  PORTFOLIO: 4,
+  ORG_USER: 5,
+  /** Volumetrica Trading Rules admin changes (or custom webhook category). */
+  TRADING_RULES: 6,
 } as const;
 
 interface WebhookEvent {
@@ -27,21 +39,25 @@ interface WebhookEvent {
     dxAgreementSigned?: boolean;
     dxAgreementLink?: string | null;
   } | null;
+  tradingRule?: unknown;
+  tradingRules?: unknown;
+  rules?: unknown;
 }
 
 export interface WebhookResult { status: number; note: string }
 
 /**
- * Volumetrica webhook — authenticated with the same DXFEED_API_KEY (x-api-key).
+ * Volumetrica webhook — authenticated with DXFEED_API_KEY (x-api-key).
  * Must 200 on processing errors so their queue is not blocked.
+ * 401 only when the key is missing/wrong (never process unauthenticated).
  */
 export async function handleDxFeedWebhook(apiKey: string | undefined, body: unknown): Promise<WebhookResult> {
-  if (!config.dxfeed.apiKey || apiKey !== config.dxfeed.apiKey) {
+  if (!config.dxfeed.apiKey || !dxFeedApiKeyOk(apiKey)) {
     return { status: 401, note: "bad or missing x-api-key" };
   }
   try {
     const ev = (body ?? {}) as WebhookEvent;
-    await dispatch(ev);
+    await dispatch(ev, body);
     return { status: 200, note: `category=${ev.category} event=${ev.event}` };
   } catch (err) {
     console.warn("[dxfeed webhook] processing error (ack 200 anyway):", (err as Error).message);
@@ -49,7 +65,21 @@ export async function handleDxFeedWebhook(apiKey: string | undefined, body: unkn
   }
 }
 
-async function dispatch(ev: WebhookEvent): Promise<void> {
+async function dispatch(ev: WebhookEvent, rawBody: unknown): Promise<void> {
+  // Trading-rule payloads may arrive as category=6 OR as a body that simply
+  // contains tradingRule(s) — accept both so Admin rule edits always land.
+  const rulePayloads = extractTradingRulesFromBody(rawBody);
+  if (ev.category === NotificationCategory.TRADING_RULES || rulePayloads.length > 0) {
+    if (rulePayloads.length > 0) {
+      const results = await syncTradingRulesFromBody(rawBody);
+      const ok = results.filter((r) => r.applied).length;
+      console.log(`[dxfeed webhook] trading rules synced ${ok}/${results.length}`);
+    }
+    if (ev.category === NotificationCategory.TRADING_RULES) return;
+    // If category was something else but body also carried rules, fall through
+    // so account/subscription updates still process.
+  }
+
   switch (ev.category) {
     case NotificationCategory.ACCOUNTS: {
       const accountId = ev.accountId ?? ev.tradingAccount?.id ?? null;
