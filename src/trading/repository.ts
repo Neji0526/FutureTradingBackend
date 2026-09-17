@@ -4,10 +4,12 @@ import { SYMBOLS } from "../instruments.js";
 /** Default evaluation parameters for a newly registered trader. */
 const STARTING_BALANCE = 50_000;
 const DEFAULT_RULE = { maxDailyLoss: 2_500, maxDrawdown: 3_000, profitTarget: 6_000, maxContracts: 5 };
-// Starting tier for a self-registered trader: the $50,000 Challenge Phase 1. Linking the
-// account to this template (not just an ad-hoc rule) is what makes it show up as a proper
-// "$50,000" tier in the admin "Account size / type" control instead of "Select a tier…".
-const DEFAULT_TIER_ID = "c1_50k";
+// Prefer dxFeed-synced References (same name as Volumetrica), then legacy seed ids.
+const DEFAULT_TIER_CANDIDATES = [
+  "PRIME_50K_EVAL_PHASE1",
+  "PRIME_50K_EVAL",
+  "c1_50k",
+];
 
 export interface ViolationRecord {
   id: string;
@@ -43,18 +45,20 @@ export async function createEvaluationAccount(userId: string): Promise<void> {
   try {
     await client.query("BEGIN");
 
-    // Pull the starting tier so the account is linked to a real template (size +
-    // full ruleset). Falls back to the ad-hoc DEFAULT_RULE if the template is absent.
-    const tpl = (
-      await client.query(
-        `SELECT "phase","accountSize","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
-                "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
-                "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
-                "drawdownType","allowedInstruments"
-         FROM "RuleTemplate" WHERE "id" = $1`,
-        [DEFAULT_TIER_ID],
-      )
-    ).rows[0];
+    // Prefer dxFeed-synced Phase 1 References, then legacy seed id.
+    const tplRes = await client.query(
+      `SELECT "id","phase","accountSize","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+              "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+              "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+              "drawdownType","allowedInstruments"
+       FROM "RuleTemplate"
+       WHERE "id" = ANY($1::text[]) OR "externalReference" = ANY($1::text[])
+       ORDER BY array_position($1::text[], "id"), array_position($1::text[], "externalReference")
+       LIMIT 1`,
+      [DEFAULT_TIER_CANDIDATES],
+    );
+    const tpl = tplRes.rows[0];
+    const tierId = tpl ? (tpl.id as string) : null;
 
     const size = tpl ? Number(tpl.accountSize) : STARTING_BALANCE;
     const phase = tpl && tpl.phase !== "Challenge Phase 1" ? 2 : 1;
@@ -67,7 +71,7 @@ export async function createEvaluationAccount(userId: string): Promise<void> {
        VALUES ($1,$2,$3,$3,$3,$3,$3,CURRENT_DATE,$3,$3,$4,now(),'ACTIVE')
        ON CONFLICT ("userId") DO NOTHING
        RETURNING "id"`,
-      [userId, tpl ? DEFAULT_TIER_ID : null, size, phase],
+      [userId, tierId, size, phase],
     );
     const accountId = acc.rows[0]?.id;
     if (accountId) {

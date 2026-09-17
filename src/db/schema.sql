@@ -303,19 +303,25 @@ INSERT INTO "RuleTemplate" (
   ('f_500k',  'Funded — $500,000',            'Funded',            500000,   8, 10000, 15000, 50000, 20, 15, 20,  2500, 20.0, true,  30, true,  true, 'EOD'),
   ('f_1m',    'Funded — $1,000,000',          'Funded',            1000000,  9, 20000, 30000, 100000,30, 15, 20,  5000, 30.0, true,  30, true,  true, 'EOD')
 ON CONFLICT ("id") DO UPDATE SET
-  "maxDailyLoss"            = EXCLUDED."maxDailyLoss",
-  "maxDrawdown"             = EXCLUDED."maxDrawdown",
-  "profitTarget"            = EXCLUDED."profitTarget",
-  "maxContracts"            = EXCLUDED."maxContracts",
-  "minTradingDays"          = EXCLUDED."minTradingDays",
-  "maxDailyProfitPct"       = EXCLUDED."maxDailyProfitPct",
-  "maxRiskPerTrade"         = EXCLUDED."maxRiskPerTrade",
-  "maxPositionUnits"        = EXCLUDED."maxPositionUnits",
-  "stopLossRequired"        = EXCLUDED."stopLossRequired",
-  "minHoldTimeSecs"         = EXCLUDED."minHoldTimeSecs",
-  "overnightHoldsProhibited"= EXCLUDED."overnightHoldsProhibited",
-  "weekendHoldsProhibited"  = EXCLUDED."weekendHoldsProhibited",
-  "drawdownType"            = EXCLUDED."drawdownType";
+  "label"                   = EXCLUDED."label",
+  "phase"                   = EXCLUDED."phase",
+  "accountSize"             = EXCLUDED."accountSize",
+  "sortOrder"               = EXCLUDED."sortOrder",
+  -- Limits: only refresh from seed while still locally owned. Once dxFeed syncs
+  -- a template (source = 'dxfeed'), Volumetrica webhooks own the numbers.
+  "maxDailyLoss"            = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."maxDailyLoss" ELSE "RuleTemplate"."maxDailyLoss" END,
+  "maxDrawdown"             = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."maxDrawdown" ELSE "RuleTemplate"."maxDrawdown" END,
+  "profitTarget"            = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."profitTarget" ELSE "RuleTemplate"."profitTarget" END,
+  "maxContracts"            = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."maxContracts" ELSE "RuleTemplate"."maxContracts" END,
+  "minTradingDays"          = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."minTradingDays" ELSE "RuleTemplate"."minTradingDays" END,
+  "maxDailyProfitPct"       = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."maxDailyProfitPct" ELSE "RuleTemplate"."maxDailyProfitPct" END,
+  "maxRiskPerTrade"         = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."maxRiskPerTrade" ELSE "RuleTemplate"."maxRiskPerTrade" END,
+  "maxPositionUnits"        = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."maxPositionUnits" ELSE "RuleTemplate"."maxPositionUnits" END,
+  "stopLossRequired"        = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."stopLossRequired" ELSE "RuleTemplate"."stopLossRequired" END,
+  "minHoldTimeSecs"         = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."minHoldTimeSecs" ELSE "RuleTemplate"."minHoldTimeSecs" END,
+  "overnightHoldsProhibited"= CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."overnightHoldsProhibited" ELSE "RuleTemplate"."overnightHoldsProhibited" END,
+  "weekendHoldsProhibited"  = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."weekendHoldsProhibited" ELSE "RuleTemplate"."weekendHoldsProhibited" END,
+  "drawdownType"            = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."drawdownType" ELSE "RuleTemplate"."drawdownType" END;
 
 -- Default external references matching Volumetrica Admin Trading rules.
 UPDATE "RuleTemplate" SET "externalReference" = 'PRIME_50K_EVAL' WHERE "id" = 'c1_50k' AND "externalReference" IS NULL;

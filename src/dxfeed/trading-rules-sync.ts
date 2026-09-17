@@ -1,20 +1,16 @@
 import { timingSafeEqual } from "node:crypto";
 import { config, useDatabase } from "../config.js";
-import { adminUpdateRuleTemplate, adminListRuleTemplates } from "../trading/admin-repository.js";
-import { getPool } from "../db/pool.js";
+import { upsertDxFeedRuleTemplate } from "../trading/admin-repository.js";
 
 /**
  * dxFeed / Volumetrica Trading Rules → Vault RuleTemplate sync.
  *
- * Admin edits on dxfeed.volumetricaprop.com/Admin/.../TradingRules push here via
- * webhook (or POST /api/dxfeed/trading-rules). We map their Reference
- * (e.g. PRIME_50K_EVAL) onto our RuleTemplate ids, cascade into every linked
- * per-account Rule row, and OrderEngine / RiskEngine pick the new limits up
- * on the next order / equity tick — no SignalApp involvement.
+ * The Volumetrica Reference (e.g. PRIME_50K_EVAL_PHASE1) IS the Vault template id.
+ * New rules added in Volumetrica are inserted automatically; edits update + cascade
+ * to every linked account. No DXFEED_RULE_MAP required.
  */
 
 export type DxFeedTradingRulePayload = {
-  /** Volumetrica rule Reference, e.g. PRIME_50K_EVAL */
   reference?: string | null;
   Reference?: string | null;
   id?: string | null;
@@ -32,7 +28,6 @@ export type DxFeedTradingRulePayload = {
   profitTarget?: number | string | null;
   ProfitTgt?: number | string | null;
   "Profit Tgt"?: number | string | null;
-  /** e.g. "5/50" → 5 minis / 50 micros */
   universe?: string | null;
   Universe?: string | null;
   currency?: string | null;
@@ -94,33 +89,26 @@ export function dxFeedApiKeyOk(provided: string | undefined | null): boolean {
   }
 }
 
+/** Sanitize Reference into a stable RuleTemplate id (same visible name). */
+export function referenceAsTemplateId(reference: string): string {
+  const raw = reference.trim();
+  // Keep Volumetrica References as-is when already safe; otherwise normalize.
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(raw)) return raw;
+  return raw
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120) || "DXFEED_RULE";
+}
+
 /**
- * Default Reference → RuleTemplate id map.
- * Override with DXFEED_RULE_MAP JSON, e.g.
- * {"PRIME_50K_EVAL":"c1_50k","PRIME_50K_FUND":"f_50k"}
+ * Optional legacy remap via DXFEED_RULE_MAP. Default: template id = Reference.
  */
-export function resolveTemplateId(reference: string): string | null {
+export function resolveTemplateId(reference: string): string {
   const key = reference.trim().toUpperCase();
   const fromEnv = config.dxfeed.ruleMap[key] ?? config.dxfeed.ruleMap[reference.trim()];
   if (fromEnv) return fromEnv;
-
-  const defaults: Record<string, string> = {
-    PRIME_50K_EVAL: "c1_50k",
-    PRIME_50K_FUND: "f_50k",
-    PRIME_100K_EVAL: "c1_100k",
-    PRIME_100K_FUND: "f_100k",
-    C1_50K: "c1_50k",
-    C2_50K: "c2_50k",
-    F_50K: "f_50k",
-  };
-  if (defaults[key]) return defaults[key];
-
-  const known = new Set([
-    "c1_50k", "c1_100k", "c2_50k", "c2_100k",
-    "f_50k", "f_100k", "f_250k", "f_500k", "f_1m",
-  ]);
-  if (known.has(reference.trim())) return reference.trim();
-  return null;
+  return referenceAsTemplateId(reference);
 }
 
 function parseUniverse(universe: string | undefined): { maxContracts?: number; maxPositionUnits?: number } {
@@ -132,30 +120,42 @@ function parseUniverse(universe: string | undefined): { maxContracts?: number; m
   return { maxContracts: Math.round(minis), maxPositionUnits: minis };
 }
 
-function inferDrawdownType(reference: string, explicit?: string): "INTRADAY" | "EOD" | undefined {
+function inferDrawdownType(reference: string, explicit?: string): "INTRADAY" | "EOD" {
   const e = explicit?.trim().toUpperCase();
   if (e === "INTRADAY" || e === "EOD") return e;
   const r = reference.toUpperCase();
-  if (r.includes("FUND") || r.startsWith("F_")) return "EOD";
-  if (r.includes("EVAL") || r.includes("C1") || r.includes("C2") || r.includes("CHALLENGE")) {
-    return "INTRADAY";
+  if (r.includes("FUND")) return "EOD";
+  return "INTRADAY";
+}
+
+function inferPhase(reference: string, label?: string): string {
+  const hay = `${reference} ${label ?? ""}`.toUpperCase();
+  if (hay.includes("PHASE2") || hay.includes("PHASE_2") || hay.includes("PHASE 2")) {
+    return "Challenge Phase 2";
   }
-  return undefined;
+  if (hay.includes("PHASE1") || hay.includes("PHASE_1") || hay.includes("PHASE 1") || hay.includes("EVAL")) {
+    return "Challenge Phase 1";
+  }
+  if (hay.includes("FUND")) return "Funded";
+  return "dxFeed";
 }
 
 export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
   reference: string;
   label?: string;
   accountSize?: number;
-  fields: Parameters<typeof adminUpdateRuleTemplate>[1];
+  phase: string;
+  fields: Parameters<typeof upsertDxFeedRuleTemplate>[0]["fields"];
 } | null {
-  const reference =
+  const referenceRaw =
     str(raw.reference) ??
     str(raw.Reference) ??
     str(raw.id) ??
     str(raw.ruleId);
-  if (!reference) return null;
+  if (!referenceRaw) return null;
 
+  const reference = resolveTemplateId(referenceRaw);
+  const label = str(raw.description) ?? str(raw.Description);
   const universe = str(raw.universe) ?? str(raw.Universe);
   const fromUniverse = parseUniverse(universe);
 
@@ -168,7 +168,7 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
   const accountSize =
     num(raw.startBalance) ?? num(raw.StartBalance);
 
-  const fields: Parameters<typeof adminUpdateRuleTemplate>[1] = {};
+  const fields: Parameters<typeof upsertDxFeedRuleTemplate>[0]["fields"] = {};
   if (maxDrawdown != null) fields.maxDrawdown = maxDrawdown;
   if (maxDailyLoss != null) fields.maxDailyLoss = maxDailyLoss;
   if (profitTarget != null) fields.profitTarget = profitTarget;
@@ -191,116 +191,67 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
   const wk = bool(raw.weekendHoldsProhibited);
   if (wk != null) fields.weekendHoldsProhibited = wk;
 
-  const ddType = inferDrawdownType(reference, str(raw.drawdownType));
-  if (ddType) fields.drawdownType = ddType;
+  fields.drawdownType = inferDrawdownType(referenceRaw, str(raw.drawdownType));
 
   if (Array.isArray(raw.allowedInstruments)) {
     fields.allowedInstruments = raw.allowedInstruments.filter((s) => typeof s === "string");
   }
 
+  // Sensible defaults for brand-new inserts when Volumetrica omits optional fields.
+  if (fields.stopLossRequired == null) fields.stopLossRequired = true;
+  if (fields.overnightHoldsProhibited == null) fields.overnightHoldsProhibited = true;
+  if (fields.weekendHoldsProhibited == null) fields.weekendHoldsProhibited = true;
+  if (fields.minHoldTimeSecs == null) fields.minHoldTimeSecs = 30;
+
   return {
     reference,
-    label: str(raw.description) ?? str(raw.Description),
+    label,
     accountSize,
+    phase: inferPhase(referenceRaw, label),
     fields,
   };
 }
 
-async function markSynced(templateId: string, reference: string): Promise<void> {
-  if (!useDatabase()) return;
-  try {
-    await getPool().query(
-      `UPDATE "RuleTemplate"
-       SET "externalReference" = $2,
-           "source" = 'dxfeed',
-           "syncedAt" = now(),
-           "updatedAt" = now()
-       WHERE "id" = $1`,
-      [templateId, reference],
-    );
-  } catch (err) {
-    // Older DBs before schema migrate — limits still cascade via adminUpdateRuleTemplate.
-    console.warn(
-      `[dxfeed rules] could not stamp externalReference on ${templateId}:`,
-      (err as Error).message,
-    );
-  }
-}
-
-async function touchLabelAndSize(
-  templateId: string,
-  label: string | undefined,
-  accountSize: number | undefined,
-): Promise<void> {
-  if (!useDatabase()) return;
-  const cols: string[] = [];
-  const vals: unknown[] = [templateId];
-  if (label) {
-    cols.push(`"label" = $${vals.length + 1}`);
-    vals.push(label);
-  }
-  if (accountSize != null && accountSize > 0) {
-    cols.push(`"accountSize" = $${vals.length + 1}`);
-    vals.push(accountSize);
-  }
-  if (cols.length === 0) return;
-  await getPool().query(
-    `UPDATE "RuleTemplate" SET ${cols.join(", ")}, "updatedAt" = now() WHERE "id" = $1`,
-    vals,
-  );
-}
-
-/** Apply one Volumetrica trading-rule payload onto the mapped Vault template + cascade. */
+/** Apply one Volumetrica trading-rule payload: create or update Vault template + cascade. */
 export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Promise<SyncResult> {
   const normalized = normalizeTradingRule(raw);
   if (!normalized) {
     return { reference: "?", templateId: null, applied: false, reason: "missing reference" };
   }
 
-  const templateId = resolveTemplateId(normalized.reference);
-  if (!templateId) {
-    return {
-      reference: normalized.reference,
-      templateId: null,
-      applied: false,
-      reason: `no RuleTemplate mapping for reference "${normalized.reference}" — set DXFEED_RULE_MAP`,
-    };
-  }
-
   if (!useDatabase()) {
     return {
       reference: normalized.reference,
-      templateId,
+      templateId: normalized.reference,
       applied: false,
       reason: "database not configured",
     };
   }
 
-  const hasFields = Object.keys(normalized.fields).length > 0;
-  let applied = false;
-  if (hasFields) {
-    applied = await adminUpdateRuleTemplate(templateId, normalized.fields);
+  try {
+    const templateId = await upsertDxFeedRuleTemplate({
+      reference: normalized.reference,
+      label: normalized.label ?? normalized.reference,
+      phase: normalized.phase,
+      accountSize: normalized.accountSize ?? 50_000,
+      fields: normalized.fields,
+    });
+
+    console.log(
+      `[dxfeed rules] upserted ${normalized.reference} → ${templateId}` +
+        ` fields=${Object.keys(normalized.fields).join(",") || "(meta)"}`,
+    );
+
+    return { reference: normalized.reference, templateId, applied: true };
+  } catch (err) {
+    console.warn(`[dxfeed rules] upsert failed for ${normalized.reference}:`, (err as Error).message);
+    return {
+      reference: normalized.reference,
+      templateId: null,
+      applied: false,
+      reason: (err as Error).message,
+    };
   }
-
-  await touchLabelAndSize(templateId, normalized.label, normalized.accountSize);
-  await markSynced(templateId, normalized.reference);
-
-  if (!hasFields) {
-    const list = await adminListRuleTemplates();
-    applied = list.some((t) => t.id === templateId);
-  }
-
-  console.log(
-    `[dxfeed rules] ${applied ? "synced" : "skipped"} ${normalized.reference} → ${templateId}` +
-      (hasFields ? ` fields=${Object.keys(normalized.fields).join(",")}` : " (metadata only)"),
-  );
-
-  return {
-    reference: normalized.reference,
-    templateId,
-    applied,
-    reason: applied ? undefined : "template not found or empty update",
-  };
 }
 
 /** Extract zero-or-more rule objects from a webhook / REST body. */
