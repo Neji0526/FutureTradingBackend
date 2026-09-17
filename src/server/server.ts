@@ -63,6 +63,9 @@ import {
   handleDxFeedAgreementStatus,
   handleDxFeedAgreementReset,
   handleDxFeedWebhookHttp,
+  handleDxFeedTradingRulesUpsert,
+  handleDxFeedTradingRulesPull,
+  handlePublicTradingRules,
   handleOnboardingComplete,
   handlePurchaseValidate,
 } from "../purchases/handlers.js";
@@ -217,6 +220,15 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
   if (url.pathname === "/api/dxfeed/webhook" && req.method === "POST") {
     return handleDxFeedWebhookHttp(req, res, json, readJson);
+  }
+  if (url.pathname === "/api/dxfeed/trading-rules" && req.method === "POST") {
+    return handleDxFeedTradingRulesUpsert(req, res, json, readJson);
+  }
+  if (url.pathname === "/api/dxfeed/trading-rules/pull" && req.method === "POST") {
+    return handleDxFeedTradingRulesPull(req, res, json);
+  }
+  if (url.pathname === "/api/trading-rules" && req.method === "GET") {
+    return handlePublicTradingRules(req, res, json);
   }
 
   // --- Market-data connection (Model B / byo: each user's own Databento key) ---

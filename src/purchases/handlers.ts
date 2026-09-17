@@ -16,6 +16,12 @@ import {
 import { attachDxFeedUserId, getDxFeedLinkByOrder, getDxFeedLinksByEmail, upsertDxFeedLink } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
+import {
+  dxFeedApiKeyOk,
+  syncTradingRulesFromBody,
+} from "../dxfeed/trading-rules-sync.js";
+import { adminListRuleTemplates } from "../trading/admin-repository.js";
+import { propfirm } from "../dxfeed/propfirm.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const COUNTRY_RE = /^[A-Z]{2}$/;
@@ -350,6 +356,127 @@ export async function handleDxFeedWebhookHttp(
   const body = await readJson<unknown>(req);
   const result = await handleDxFeedWebhook(apiKey, body);
   json(res, result.status, { ok: result.status === 200, note: result.note });
+}
+
+/**
+ * Explicit Trading Rules upsert from dxFeed / Volumetrica Admin.
+ * Protected by DXFEED_API_KEY (x-api-key). Cascades into every linked account Rule.
+ *
+ * Body examples:
+ *   { "reference":"PRIME_50K_EVAL", "startBalance":50000, "maxDrawdown":2500, "dailyDrawdown":1250, "universe":"5/50" }
+ *   { "tradingRules":[ {...}, {...} ] }
+ */
+export async function handleDxFeedTradingRulesUpsert(
+  req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+  readJson: ReadJsonFn,
+): Promise<void> {
+  const apiKeyHeader = req.headers["x-api-key"];
+  const apiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+  if (!dxFeedApiKeyOk(apiKey)) {
+    json(res, 401, { error: "Unauthorized. Provide a valid x-api-key." });
+    return;
+  }
+
+  const body = (await readJson<unknown>(req)) ?? {};
+  try {
+    const results = await syncTradingRulesFromBody(body);
+    if (results.length === 0) {
+      json(res, 400, {
+        error: "No trading rules found in body. Send tradingRule, tradingRules[], or a Reference object.",
+      });
+      return;
+    }
+    json(res, 200, {
+      ok: true,
+      synced: results.filter((r) => r.applied).length,
+      results,
+    });
+  } catch (err) {
+    console.warn("[dxfeed trading-rules] upsert error:", (err as Error).message);
+    json(res, 500, { error: "Could not sync trading rules." });
+  }
+}
+
+/**
+ * Pull trading rules from Volumetrica Propsite (best-effort) and sync locally.
+ * Protected by DXFEED_API_KEY. Safe to call periodically from an admin job.
+ */
+export async function handleDxFeedTradingRulesPull(
+  req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+): Promise<void> {
+  const apiKeyHeader = req.headers["x-api-key"];
+  const apiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+  if (!dxFeedApiKeyOk(apiKey)) {
+    json(res, 401, { error: "Unauthorized. Provide a valid x-api-key." });
+    return;
+  }
+
+  try {
+    const remote = await propfirm.getTradingRules();
+    const results = await syncTradingRulesFromBody({ data: remote });
+    json(res, 200, {
+      ok: true,
+      pulled: Array.isArray(remote) ? remote.length : 1,
+      synced: results.filter((r) => r.applied).length,
+      results,
+    });
+  } catch (err) {
+    const message = err instanceof DxFeedApiError
+      ? err.message
+      : (err as Error).message;
+    console.warn("[dxfeed trading-rules] pull error:", message);
+    json(res, 502, {
+      error: "Could not pull trading rules from dxFeed.",
+      detail: message.slice(0, 300),
+    });
+  }
+}
+
+/** Public read of the rule templates currently enforced for traders. */
+export async function handlePublicTradingRules(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  json: JsonFn,
+): Promise<void> {
+  if (!useDatabase) {
+    json(res, 503, { error: "Database not configured." });
+    return;
+  }
+  try {
+    const templates = await adminListRuleTemplates();
+    json(res, 200, {
+      ok: true,
+      source: "vault",
+      note: "Limits are enforced from Rule rows cascaded from these templates. dxFeed Admin syncs overwrite mapped templates.",
+      templates: templates.map((t) => ({
+        id: t.id,
+        label: t.label,
+        phase: t.phase,
+        accountSize: t.accountSize,
+        maxDailyLoss: t.maxDailyLoss,
+        maxDrawdown: t.maxDrawdown,
+        profitTarget: t.profitTarget,
+        maxContracts: t.maxContracts,
+        maxPositionUnits: t.maxPositionUnits,
+        maxRiskPerTrade: t.maxRiskPerTrade,
+        minTradingDays: t.minTradingDays,
+        maxDailyProfitPct: t.maxDailyProfitPct,
+        minHoldTimeSecs: t.minHoldTimeSecs,
+        stopLossRequired: t.stopLossRequired,
+        overnightHoldsProhibited: t.overnightHoldsProhibited,
+        weekendHoldsProhibited: t.weekendHoldsProhibited,
+        drawdownType: t.drawdownType,
+        updatedAt: t.updatedAt,
+      })),
+    });
+  } catch (err) {
+    console.warn("[trading-rules] list error:", (err as Error).message);
+    json(res, 500, { error: "Could not load trading rules." });
+  }
 }
 
 /**
