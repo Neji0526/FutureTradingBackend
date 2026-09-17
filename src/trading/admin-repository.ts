@@ -728,6 +728,11 @@ export interface AdminRuleTemplate {
   weekendHoldsProhibited: boolean;
   drawdownType: string; // 'INTRADAY' | 'EOD'
   allowedInstruments: string[];
+  /** 'local' | 'dxfeed' — dxFeed webhook sync owns limits when 'dxfeed'. */
+  source: string;
+  /** Volumetrica Trading Rule Reference, e.g. PRIME_50K_EVAL. */
+  externalReference: string | null;
+  syncedAt: number | null;
   updatedAt: number;
 }
 
@@ -737,7 +742,9 @@ export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
     `SELECT "id","label","phase","accountSize","sortOrder","maxDailyLoss","maxDrawdown",
             "profitTarget","maxContracts","minTradingDays","maxDailyProfitPct",
             "maxRiskPerTrade","maxPositionUnits","stopLossRequired","minHoldTimeSecs",
-            "overnightHoldsProhibited","weekendHoldsProhibited","drawdownType","allowedInstruments","updatedAt"
+            "overnightHoldsProhibited","weekendHoldsProhibited","drawdownType","allowedInstruments",
+            COALESCE("source", 'local') AS "source",
+            "externalReference","syncedAt","updatedAt"
      FROM "RuleTemplate" ORDER BY "sortOrder"`,
   );
   return rows.map((r) => ({
@@ -760,6 +767,9 @@ export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
     weekendHoldsProhibited: Boolean(r.weekendHoldsProhibited),
     drawdownType: (r.drawdownType as string) ?? "INTRADAY",
     allowedInstruments: (r.allowedInstruments as string[] | null) ?? [],
+    source: (r.source as string) ?? "local",
+    externalReference: (r.externalReference as string | null) ?? null,
+    syncedAt: r.syncedAt ? new Date(r.syncedAt as string | Date).getTime() : null,
     updatedAt: new Date(r.updatedAt).getTime(),
   }));
 }
@@ -814,6 +824,100 @@ export async function adminUpdateRuleTemplate(id: string, fields: TemplateFields
     vals,
   );
   return true;
+}
+
+export type UpsertDxFeedTemplateInput = {
+  /** Same as Volumetrica Reference — used as RuleTemplate.id */
+  reference: string;
+  label: string;
+  phase: string;
+  accountSize: number;
+  fields: TemplateFields;
+};
+
+/**
+ * Insert-or-update a RuleTemplate keyed by the dxFeed Reference name, then cascade
+ * limit fields to every linked account. New References appear in Admin Rules automatically.
+ */
+export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput): Promise<string> {
+  const id = input.reference.trim();
+  const pool = getPool();
+
+  // Prefer an existing row already linked to this Reference (legacy c1_50k, etc.).
+  const existing = await pool.query<{ id: string }>(
+    `SELECT "id" FROM "RuleTemplate"
+     WHERE "id" = $1 OR "externalReference" = $1
+     ORDER BY CASE WHEN "id" = $1 THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [id],
+  );
+  const templateId = existing.rows[0]?.id ?? id;
+
+  if (!existing.rows[0]) {
+    const sort = await pool.query<{ n: number }>(`SELECT COALESCE(MAX("sortOrder"), 0) + 1 AS n FROM "RuleTemplate"`);
+    const sortOrder = Number(sort.rows[0]?.n ?? 1);
+    await pool.query(
+      `INSERT INTO "RuleTemplate" (
+         "id","label","phase","accountSize","sortOrder",
+         "maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+         "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+         "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+         "drawdownType","allowedInstruments","externalReference","source","syncedAt","updatedAt"
+       ) VALUES (
+         $1,$2,$3,$4,$5,
+         $6,$7,$8,$9,
+         $10,$11,$12,$13,
+         $14,$15,$16,$17,
+         $18,'{}',$1,'dxfeed',now(),now()
+       )`,
+      [
+        templateId,
+        input.label || templateId,
+        input.phase,
+        input.accountSize > 0 ? input.accountSize : 50_000,
+        sortOrder,
+        input.fields.maxDailyLoss ?? 0,
+        input.fields.maxDrawdown ?? 0,
+        input.fields.profitTarget ?? 0,
+        input.fields.maxContracts ?? 3,
+        input.fields.minTradingDays ?? 5,
+        input.fields.maxDailyProfitPct ?? 30,
+        input.fields.maxRiskPerTrade ?? 0,
+        input.fields.maxPositionUnits ?? 0,
+        input.fields.stopLossRequired ?? true,
+        input.fields.minHoldTimeSecs ?? 30,
+        input.fields.overnightHoldsProhibited ?? true,
+        input.fields.weekendHoldsProhibited ?? true,
+        input.fields.drawdownType === "EOD" ? "EOD" : "INTRADAY",
+      ],
+    );
+  } else {
+    await pool.query(
+      `UPDATE "RuleTemplate"
+       SET "label" = COALESCE(NULLIF($2, ''), "label"),
+           "phase" = $3,
+           "accountSize" = CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE "accountSize" END,
+           "externalReference" = $1,
+           "source" = 'dxfeed',
+           "syncedAt" = now(),
+           "updatedAt" = now()
+       WHERE "id" = $5`,
+      [id, input.label || id, input.phase, input.accountSize > 0 ? input.accountSize : 0, templateId],
+    );
+  }
+
+  const hasFields = Object.keys(input.fields).length > 0;
+  if (hasFields) {
+    await adminUpdateRuleTemplate(templateId, input.fields);
+  } else if (existing.rows[0]) {
+    await pool.query(
+      `UPDATE "RuleTemplate" SET "source" = 'dxfeed', "externalReference" = $2, "syncedAt" = now(), "updatedAt" = now()
+       WHERE "id" = $1`,
+      [templateId, id],
+    );
+  }
+
+  return templateId;
 }
 
 /** Reset an evaluation account to its day-1 state: wipe positions/orders/violations,
