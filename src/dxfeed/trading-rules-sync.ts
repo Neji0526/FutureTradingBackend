@@ -219,7 +219,7 @@ export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Pro
     return { reference: "?", templateId: null, applied: false, reason: "missing reference" };
   }
 
-  if (!useDatabase()) {
+  if (!useDatabase) {
     return {
       reference: normalized.reference,
       templateId: normalized.reference,
