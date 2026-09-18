@@ -6,7 +6,12 @@ import type { UserStore } from "../auth/users.js";
 import { getPurchaseStore } from "./store.js";
 import { extractPurchaseFields } from "./extract.js";
 import { getOnboardingProfileStore } from "./onboarding-profile.js";
-import { adminDeactivateSubscription } from "../trading/admin-repository.js";
+import {
+  adminDeactivateSubscription,
+  adminListRuleTemplates,
+  deleteDxFeedRuleTemplateByRuleId,
+  listDxFeedSyncedRuleIds,
+} from "../trading/admin-repository.js";
 import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
 import {
   provisionForOnboarding,
@@ -20,9 +25,8 @@ import {
   dxFeedApiKeyOk,
   syncTradingRulesFromBody,
 } from "../dxfeed/trading-rules-sync.js";
-import { adminListRuleTemplates } from "../trading/admin-repository.js";
 import { propfirm } from "../dxfeed/propfirm.js";
-
+import { noteTradingRulesFingerprintFromBody } from "../dxfeed/trading-rules-watch.js";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const COUNTRY_RE = /^[A-Z]{2}$/;
 
@@ -419,17 +423,23 @@ export async function handleDxFeedTradingRulesPull(
     return;
   }
 
-  console.log("[dxfeed trading-rules] POST pull — fetching GetTradingRules/GetAccountRules");
+  console.log("[dxfeed trading-rules] POST pull — V2 TradingRule/List");
   try {
-    const remote = await propfirm.getTradingRules();
-    const pulled = Array.isArray(remote) ? remote.length : remote ? 1 : 0;
-    console.log(`[dxfeed trading-rules] pull remote count=${pulled}`);
-    const results = await syncTradingRulesFromBody({ data: remote });
+    const knownIds = await listDxFeedSyncedRuleIds().catch(() => [] as string[]);
+    const { rules, missingRuleIds } = await propfirm.fetchTradingRulesFromRest(knownIds);
+    for (const missing of missingRuleIds) {
+      await deleteDxFeedRuleTemplateByRuleId(missing);
+    }
+    const pulled = rules.length;
+    console.log(`[dxfeed trading-rules] pull remote count=${pulled} missing=${missingRuleIds.length}`);
+    const results = await syncTradingRulesFromBody({ data: rules });
     const synced = results.filter((r) => r.applied).length;
+    noteTradingRulesFingerprintFromBody({ data: rules });
     console.log(`[dxfeed trading-rules] pull ok — synced ${synced}/${results.length}`);
     json(res, 200, {
       ok: true,
       pulled,
+      deleted: missingRuleIds.length,
       synced,
       results,
     });
@@ -439,7 +449,7 @@ export async function handleDxFeedTradingRulesPull(
       : (err as Error).message;
     console.warn("[dxfeed trading-rules] pull error:", message);
     json(res, 502, {
-      error: "Could not pull trading rules from dxFeed.",
+      error: "Could not pull trading rules from dxFeed REST API.",
       detail: message.slice(0, 300),
     });
   }

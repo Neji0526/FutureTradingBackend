@@ -1,5 +1,6 @@
 import { getPool } from "../db/pool.js";
 import { SYMBOLS } from "../instruments.js";
+import { config } from "../config.js";
 
 /** Default evaluation parameters for a newly registered trader. */
 const STARTING_BALANCE = 50_000;
@@ -11,6 +12,12 @@ const DEFAULT_TIER_CANDIDATES = [
   "c1_50k",
 ];
 
+function evaluationTier(): string[] {
+  const fromEnv = config.dxfeed.provisioning.ruleId.trim();
+  const out = [...DEFAULT_TIER_CANDIDATES];
+  if (fromEnv) out.unshift(fromEnv);
+  return out;
+}
 export interface ViolationRecord {
   id: string;
   ts: number;
@@ -40,12 +47,17 @@ export async function listViolations(accountId: string): Promise<ViolationRecord
  * Provision a default evaluation account (Account + Rule + opening deposit) for a
  * user, atomically. Idempotent: does nothing if the user already has an account.
  */
-export async function createEvaluationAccount(userId: string): Promise<void> {
+export async function createEvaluationAccount(userId: string, preferredTemplateId?: string | null): Promise<void> {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
 
-    // Prefer dxFeed-synced Phase 1 References, then legacy seed id.
+    const candidates = [
+      ...(preferredTemplateId?.trim() ? [preferredTemplateId.trim()] : []),
+      ...evaluationTier(),
+    ];
+
+    // Prefer dxFeed-synced Phase 1 References / rule UUID, then legacy seed id.
     const tplRes = await client.query(
       `SELECT "id","phase","accountSize","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
               "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
@@ -53,9 +65,12 @@ export async function createEvaluationAccount(userId: string): Promise<void> {
               "drawdownType","allowedInstruments"
        FROM "RuleTemplate"
        WHERE "id" = ANY($1::text[]) OR "externalReference" = ANY($1::text[])
-       ORDER BY array_position($1::text[], "id"), array_position($1::text[], "externalReference")
+       ORDER BY
+         CASE WHEN "source" = 'dxfeed' THEN 0 ELSE 1 END,
+         array_position($1::text[], "id"),
+         array_position($1::text[], "externalReference")
        LIMIT 1`,
-      [DEFAULT_TIER_CANDIDATES],
+      [candidates],
     );
     const tpl = tplRes.rows[0];
     const tierId = tpl ? (tpl.id as string) : null;

@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { config, useDatabase } from "../config.js";
 import { upsertDxFeedRuleTemplate } from "../trading/admin-repository.js";
+import { propfirm } from "./propfirm.js";
 
 /**
  * dxFeed / Volumetrica Trading Rules → Vault RuleTemplate sync.
@@ -13,6 +14,7 @@ import { upsertDxFeedRuleTemplate } from "../trading/admin-repository.js";
 export type DxFeedTradingRulePayload = {
   reference?: string | null;
   Reference?: string | null;
+  organizationReferenceId?: string | null;
   id?: string | null;
   ruleId?: string | null;
   RuleId?: string | null;
@@ -20,15 +22,19 @@ export type DxFeedTradingRulePayload = {
   Description?: string | null;
   startBalance?: number | string | null;
   StartBalance?: number | string | null;
+  startingBalance?: number | string | null;
   maxDrawdown?: number | string | null;
   MaxDD?: number | string | null;
   "Max. DD"?: number | string | null;
+  maxDrawdownMoney?: number | string | null;
   dailyDrawdown?: number | string | null;
   DailyDD?: number | string | null;
   "Daily. DD"?: number | string | null;
+  maxIntradayDrawdownMoney?: number | string | null;
   profitTarget?: number | string | null;
   ProfitTgt?: number | string | null;
   "Profit Tgt"?: number | string | null;
+  profitTargetMoney?: number | string | null;
   universe?: string | null;
   Universe?: string | null;
   currency?: string | null;
@@ -37,12 +43,16 @@ export type DxFeedTradingRulePayload = {
   Margin?: number | string | null;
   maxRiskPerTrade?: number | string | null;
   minHoldTimeSecs?: number | string | null;
+  scalpingMinSeconds?: number | string | null;
   minTradingDays?: number | string | null;
+  minSessionNumbers?: number | string | null;
   maxDailyProfitPct?: number | string | null;
   stopLossRequired?: boolean | null;
   drawdownType?: string | null;
   overnightHoldsProhibited?: boolean | null;
   weekendHoldsProhibited?: boolean | null;
+  failOnOvernight?: boolean | null;
+  failOnOverweekend?: boolean | null;
   allowedInstruments?: string[] | null;
 };
 
@@ -143,17 +153,16 @@ function inferPhase(reference: string, label?: string): string {
 
 export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
   reference: string;
+  dxRuleId?: string;
   label?: string;
   accountSize?: number;
   phase: string;
   fields: Parameters<typeof upsertDxFeedRuleTemplate>[0]["fields"];
 } | null {
-  const referenceRaw =
-    str(raw.reference) ??
-    str(raw.Reference) ??
-    str(raw.ruleId) ??
-    str(raw.RuleId) ??
-    str(raw.id);
+  // Prefer organization Reference (Admin "Organization reference id") as Vault template id.
+  const orgRef = str(raw.organizationReferenceId) ?? str(raw.reference) ?? str(raw.Reference);
+  const dxRuleId = str(raw.ruleId) ?? str(raw.RuleId);
+  const referenceRaw = orgRef ?? dxRuleId ?? str(raw.id);
   if (!referenceRaw) return null;
 
   const reference = resolveTemplateId(referenceRaw);
@@ -162,13 +171,16 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
   const fromUniverse = parseUniverse(universe);
 
   const maxDrawdown =
-    num(raw.maxDrawdown) ?? num(raw.MaxDD) ?? num(raw["Max. DD"]);
+    num(raw.maxDrawdown) ?? num(raw.maxDrawdownMoney) ?? num(raw.MaxDD) ?? num(raw["Max. DD"]);
   const maxDailyLoss =
-    num(raw.dailyDrawdown) ?? num(raw.DailyDD) ?? num(raw["Daily. DD"]);
+    num(raw.dailyDrawdown) ??
+    num(raw.maxIntradayDrawdownMoney) ??
+    num(raw.DailyDD) ??
+    num(raw["Daily. DD"]);
   const profitTarget =
-    num(raw.profitTarget) ?? num(raw.ProfitTgt) ?? num(raw["Profit Tgt"]);
+    num(raw.profitTarget) ?? num(raw.profitTargetMoney) ?? num(raw.ProfitTgt) ?? num(raw["Profit Tgt"]);
   const accountSize =
-    num(raw.startBalance) ?? num(raw.StartBalance);
+    num(raw.startBalance) ?? num(raw.startingBalance) ?? num(raw.StartBalance);
 
   const fields: Parameters<typeof upsertDxFeedRuleTemplate>[0]["fields"] = {};
   if (maxDrawdown != null) fields.maxDrawdown = maxDrawdown;
@@ -179,18 +191,22 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
 
   const risk = num(raw.maxRiskPerTrade);
   if (risk != null) fields.maxRiskPerTrade = risk;
-  const hold = num(raw.minHoldTimeSecs);
+  const hold = num(raw.minHoldTimeSecs) ?? num(raw.scalpingMinSeconds);
   if (hold != null) fields.minHoldTimeSecs = hold;
-  const days = num(raw.minTradingDays);
+  const days = num(raw.minTradingDays) ?? num(raw.minSessionNumbers);
   if (days != null) fields.minTradingDays = days;
   const pct = num(raw.maxDailyProfitPct);
   if (pct != null) fields.maxDailyProfitPct = pct;
 
   const sl = bool(raw.stopLossRequired);
   if (sl != null) fields.stopLossRequired = sl;
-  const ov = bool(raw.overnightHoldsProhibited);
+
+  const failOvernight = bool(raw.failOnOvernight);
+  const ov = bool(raw.overnightHoldsProhibited) ?? (failOvernight != null ? failOvernight : undefined);
   if (ov != null) fields.overnightHoldsProhibited = ov;
-  const wk = bool(raw.weekendHoldsProhibited);
+
+  const failWeekend = bool(raw.failOnOverweekend);
+  const wk = bool(raw.weekendHoldsProhibited) ?? (failWeekend != null ? failWeekend : undefined);
   if (wk != null) fields.weekendHoldsProhibited = wk;
 
   fields.drawdownType = inferDrawdownType(referenceRaw, str(raw.drawdownType));
@@ -207,6 +223,7 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
 
   return {
     reference,
+    dxRuleId: dxRuleId && dxRuleId !== reference ? dxRuleId : dxRuleId,
     label,
     accountSize,
     phase: inferPhase(referenceRaw, label),
@@ -248,6 +265,7 @@ export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Pro
   try {
     const templateId = await upsertDxFeedRuleTemplate({
       reference: normalized.reference,
+      dxRuleId: normalized.dxRuleId,
       label: normalized.label ?? normalized.reference,
       phase: normalized.phase,
       accountSize: normalized.accountSize ?? 50_000,
@@ -272,6 +290,31 @@ export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Pro
   }
 }
 
+/**
+ * Guide-aligned: fetch one Volumetrica rule by UUID (V1 GetTradingRule) and upsert RuleTemplate.
+ * Call after CreateTradingAccount returns tradingRuleId, or when DXFEED_DEFAULT_RULE_ID is set.
+ * Full-catalog sync uses V2 TradingRule/List via fetchTradingRulesFromRest / watch.
+ */
+export async function syncTradingRuleById(ruleId: string): Promise<SyncResult> {
+  const id = ruleId.trim();
+  if (!id) {
+    return { reference: "?", templateId: null, applied: false, reason: "missing ruleId" };
+  }
+  console.log(`[dxfeed rules] REST GetTradingRule ruleId=${id}`);
+  try {
+    const rule = await propfirm.getTradingRule(id);
+    return await applyDxFeedTradingRule(rule as DxFeedTradingRulePayload);
+  } catch (err) {
+    console.warn(`[dxfeed rules] GetTradingRule(${id}) failed:`, (err as Error).message);
+    return {
+      reference: id,
+      templateId: null,
+      applied: false,
+      reason: (err as Error).message,
+    };
+  }
+}
+
 function summarizeRuleKeys(raw: unknown): string {
   if (!raw || typeof raw !== "object") return typeof raw;
   return Object.keys(raw as object).slice(0, 20).join(",");
@@ -283,13 +326,16 @@ function looksLikeTradingRule(x: unknown): x is DxFeedTradingRulePayload {
   return (
     typeof o.reference === "string" ||
     typeof o.Reference === "string" ||
+    typeof o.organizationReferenceId === "string" ||
     typeof o.ruleId === "string" ||
     typeof o.RuleId === "string" ||
     typeof o.id === "string" ||
     o.MaxDD != null ||
     o.maxDrawdown != null ||
+    o.maxDrawdownMoney != null ||
     o.StartBalance != null ||
-    o.startBalance != null
+    o.startBalance != null ||
+    o.startingBalance != null
   );
 }
 
