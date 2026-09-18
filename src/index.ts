@@ -19,6 +19,7 @@ import { RiskEngine } from "./trading/risk-engine.js";
 import { startResetSweeper } from "./trading/reset-sweeper.js";
 import { startMarkPublisher, stopMarkPublisher } from "./realtime/mark-publisher.js";
 import { startMarketLiveConsole } from "./market-data/live-console.js";
+import { startTradingRulesWatch } from "./dxfeed/trading-rules-watch.js";
 
 
 function buildProvider(): MarketDataProvider {
@@ -79,6 +80,7 @@ const provider = buildProvider();
 const hub = new MarketHub(provider);
 hub.start();
 const stopMarketConsole = startMarketLiveConsole(provider);
+const stopTradingRulesWatch = startTradingRulesWatch();
 
 // Real-time gateway for authenticated channels (positions/account/orders/admin).
 const accountStream = new AccountStream(provider);
@@ -191,6 +193,7 @@ server.listen(config.port, () => {
 function shutdown() {
   console.log("\nShutting down…");
   stopMarketConsole();
+  stopTradingRulesWatch();
   hub.stop();
   houseFeed?.stop();
   accountStream.stop();
