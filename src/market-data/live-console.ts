@@ -218,40 +218,38 @@ function printLiveTable(providerName: string, rows: MarketLiveRow[]): void {
   const lines: string[] = [];
   lines.push("");
   lines.push("========== MARKET LIVE STATE ==========");
-  lines.push(
-    `provider=${providerName}  at=${new Date().toISOString()}  marketOpen=${isMarketOpen()}  ` +
-      `live=${counts.live} thin=${counts.thin} flat=${counts.flat} stale=${counts.stale} ` +
-      `missing=${counts.missing} blocked=${counts.blocked} closed=${counts.closed}`,
-  );
-  if (feed) {
-    const ex = feed.exchanges.length ? feed.exchanges.join(",") : "(unknown)";
-    lines.push(
-      `exchanges=${ex}  candleEntitled=${feed.candleEntitled === null ? "?" : feed.candleEntitled}`,
-    );
-  }
-
-  lines.push(
-    pad("SYM", 5) +
-      pad("STATE", 9) +
-      pad("EX", 7) +
-      pad("LAST", 12) +
-      pad("VOL24H", 10) +
-      pad("AGE", 7) +
-      "REASON",
-  );
-  
-  lines.push("-".repeat(100));
-  for (const r of rows) {
-    lines.push(
-      pad(r.symbol, 5) +
-        pad(r.state, 9) +
-        pad(r.exchange ?? "—", 7) +
-        pad(fmt(r.price), 12) +
-        pad(r.volume24h == null ? "—" : String(Math.round(r.volume24h)), 10) +
-        pad(r.ageSec == null ? "—" : `${r.ageSec}s`, 7) +
-        (r.reason ?? ""),
-    );
-  }
+  // lines.push(
+  //   `provider=${providerName}  at=${new Date().toISOString()}  marketOpen=${isMarketOpen()}  ` +
+  //     `live=${counts.live} thin=${counts.thin} flat=${counts.flat} stale=${counts.stale} ` +
+  //     `missing=${counts.missing} blocked=${counts.blocked} closed=${counts.closed}`,
+  // );
+  // if (feed) {
+  //   const ex = feed.exchanges.length ? feed.exchanges.join(",") : "(unknown)";
+  //   lines.push(
+  //     `exchanges=${ex}  candleEntitled=${feed.candleEntitled === null ? "?" : feed.candleEntitled}`,
+  //   );
+  // }
+  // lines.push(
+  //   pad("SYM", 5) +
+  //     pad("STATE", 9) +
+  //     pad("EX", 7) +
+  //     pad("LAST", 12) +
+  //     pad("VOL24H", 10) +
+  //     pad("AGE", 7) +
+  //     "REASON",
+  // );
+  // lines.push("-".repeat(100));
+  // for (const r of rows) {
+  //   lines.push(
+  //     pad(r.symbol, 5) +
+  //       pad(r.state, 9) +
+  //       pad(r.exchange ?? "—", 7) +
+  //       pad(fmt(r.price), 12) +
+  //       pad(r.volume24h == null ? "—" : String(Math.round(r.volume24h)), 10) +
+  //       pad(r.ageSec == null ? "—" : `${r.ageSec}s`, 7) +
+  //       (r.reason ?? ""),
+  //   );
+  // }
   lines.push("=======================================");
   lines.push("");
   console.log(lines.join("\n"));
