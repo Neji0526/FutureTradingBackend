@@ -1,6 +1,6 @@
 import { getPool } from "../db/pool.js";
 import { getMultiplier } from "../instruments.js";
-import { nextTierFor } from "./tiers.js";
+import { LEGACY_TO_PRIME, nextTierFor } from "./tiers.js";
 import { bumpResetCount } from "./trader-stats.js";
 
 /* Admin/CRM reads + mutations over the real DB. Shapes mirror the frontend
@@ -736,7 +736,7 @@ export interface AdminRuleTemplate {
   updatedAt: number;
 }
 
-/** All 9 global account-tier rule templates, ordered by sort position. */
+/** Account-tier rule templates. Prefer dxFeed; hide legacy 50k seeds once PRIME exists. */
 export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
   const { rows } = await getPool().query(
     `SELECT "id","label","phase","accountSize","sortOrder","maxDailyLoss","maxDrawdown",
@@ -745,15 +745,26 @@ export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
             "overnightHoldsProhibited","weekendHoldsProhibited","drawdownType","allowedInstruments",
             COALESCE("source", 'local') AS "source",
             "externalReference","syncedAt","updatedAt"
-     FROM "RuleTemplate" ORDER BY "sortOrder"`,
+     FROM "RuleTemplate"
+     ORDER BY
+       CASE WHEN COALESCE("source", 'local') = 'dxfeed' THEN 0 ELSE 1 END,
+       "sortOrder"`,
   );
+  const ids = new Set(rows.map((r) => String(r.id)));
+  const hideLegacy = Object.entries(LEGACY_TO_PRIME)
+    .filter(([, prime]) => ids.has(prime))
+    .map(([legacy]) => legacy);
+  const filtered = hideLegacy.length
+    ? rows.filter((r) => !hideLegacy.includes(String(r.id)))
+    : rows;
+
   console.log(
-    `[dxfeed rules] GET RuleTemplate — count=${rows.length}` +
-      (rows.length
-        ? ` ids=[${rows.map((r) => String(r.id)).join(", ")}]`
-        : " (empty — sync via Volumetrica webhook or POST /api/dxfeed/trading-rules/pull)"),
+    `[dxfeed rules] GET RuleTemplate — count=${filtered.length}` +
+      (filtered.length
+        ? ` ids=[${filtered.map((r) => String(r.id)).join(", ")}]`
+        : " (empty — sync via V2 TradingRule/List or POST /api/dxfeed/trading-rules/pull)"),
   );
-  return rows.map((r) => ({
+  return filtered.map((r) => ({
     id: r.id,
     label: r.label,
     phase: r.phase,
@@ -966,6 +977,86 @@ export async function deleteDxFeedRuleTemplateByRuleId(dxRuleId: string): Promis
   await pool.query(`DELETE FROM "RuleTemplate" WHERE "id" = $1 AND "source" = 'dxfeed'`, [templateId]);
   console.log(`[dxfeed rules] DELETE RuleTemplate id=${templateId} (Volumetrica rule ${id} gone)`);
   return templateId;
+}
+
+/**
+ * Point accounts still on legacy seed tiers (c1_50k / c2_50k / f_50k) at the matching
+ * dxFeed PRIME RuleTemplate, and copy limit fields onto their Rule row.
+ * Does NOT reset balances or wipe positions — users stay on the live account state.
+ */
+export async function migrateAccountsToPrimeTemplates(): Promise<number> {
+  const pool = getPool();
+  let moved = 0;
+
+  for (const [legacyId, primeId] of Object.entries(LEGACY_TO_PRIME)) {
+    const prime = await pool.query(
+      `SELECT "id","phase","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+              "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+              "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+              "drawdownType","allowedInstruments"
+       FROM "RuleTemplate" WHERE "id" = $1`,
+      [primeId],
+    );
+    const t = prime.rows[0];
+    if (!t) continue;
+
+    const accs = await pool.query<{ id: string }>(
+      `SELECT "id" FROM "Account" WHERE "ruleTemplateId" = $1`,
+      [legacyId],
+    );
+    if (accs.rows.length === 0) continue;
+
+    const challengePhase = t.phase === "Challenge Phase 1" ? 1 : 2;
+
+    for (const row of accs.rows) {
+      const accountId = row.id;
+      await pool.query(
+        `UPDATE "Account" SET "ruleTemplateId" = $2, "challengePhase" = $3, "updatedAt" = now() WHERE "id" = $1`,
+        [accountId, primeId, challengePhase],
+      );
+      await pool.query(
+        `INSERT INTO "Rule" (
+           "accountId","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+           "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+           "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+           "drawdownType","allowedInstruments","updatedAt"
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
+         ON CONFLICT ("accountId") DO UPDATE SET
+           "maxDailyLoss" = EXCLUDED."maxDailyLoss", "maxDrawdown" = EXCLUDED."maxDrawdown",
+           "profitTarget" = EXCLUDED."profitTarget", "maxContracts" = EXCLUDED."maxContracts",
+           "minTradingDays" = EXCLUDED."minTradingDays", "maxDailyProfitPct" = EXCLUDED."maxDailyProfitPct",
+           "maxRiskPerTrade" = EXCLUDED."maxRiskPerTrade", "maxPositionUnits" = EXCLUDED."maxPositionUnits",
+           "stopLossRequired" = EXCLUDED."stopLossRequired", "minHoldTimeSecs" = EXCLUDED."minHoldTimeSecs",
+           "overnightHoldsProhibited" = EXCLUDED."overnightHoldsProhibited",
+           "weekendHoldsProhibited" = EXCLUDED."weekendHoldsProhibited",
+           "drawdownType" = EXCLUDED."drawdownType", "allowedInstruments" = EXCLUDED."allowedInstruments",
+           "updatedAt" = now()`,
+        [
+          accountId,
+          Number(t.maxDailyLoss),
+          Number(t.maxDrawdown),
+          Number(t.profitTarget),
+          Number(t.maxContracts),
+          Number(t.minTradingDays),
+          Number(t.maxDailyProfitPct),
+          Number(t.maxRiskPerTrade),
+          Number(t.maxPositionUnits),
+          Boolean(t.stopLossRequired),
+          Number(t.minHoldTimeSecs),
+          Boolean(t.overnightHoldsProhibited),
+          Boolean(t.weekendHoldsProhibited),
+          t.drawdownType,
+          (t.allowedInstruments as string[] | null) ?? [],
+        ],
+      );
+      moved += 1;
+    }
+    console.log(
+      `[dxfeed rules] remapped ${accs.rows.length} account(s) ${legacyId} → ${primeId} (limits copied, balances kept)`,
+    );
+  }
+
+  return moved;
 }
 
 /** Reset an evaluation account to its day-1 state: wipe positions/orders/violations,

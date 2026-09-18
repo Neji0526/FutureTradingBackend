@@ -324,7 +324,21 @@ ON CONFLICT ("id") DO UPDATE SET
   "drawdownType"            = CASE WHEN "RuleTemplate"."source" IS DISTINCT FROM 'dxfeed' THEN EXCLUDED."drawdownType" ELSE "RuleTemplate"."drawdownType" END;
 
 -- Default external references matching Volumetrica Admin Trading rules.
-UPDATE "RuleTemplate" SET "externalReference" = 'PRIME_50K_EVAL' WHERE "id" = 'c1_50k' AND "externalReference" IS NULL;
+-- Remap accounts still on legacy 50k seeds onto dxFeed PRIME templates when those exist.
+-- Balances / positions are preserved; Rule limits are refreshed by migrateAccountsToPrimeTemplates at sync.
+UPDATE "Account" a
+SET "ruleTemplateId" = m.prime_id, "updatedAt" = now()
+FROM (VALUES
+  ('c1_50k', 'PRIME_50K_EVAL_PHASE1'),
+  ('c2_50k', 'PRIME_50K_EVAL_PHASE2'),
+  ('f_50k',  'PRIME_50K_FUND'),
+  ('PRIME_50K_EVAL', 'PRIME_50K_EVAL_PHASE1')
+) AS m(legacy_id, prime_id)
+WHERE a."ruleTemplateId" = m.legacy_id
+  AND EXISTS (SELECT 1 FROM "RuleTemplate" t WHERE t."id" = m.prime_id);
+
+UPDATE "RuleTemplate" SET "externalReference" = 'PRIME_50K_EVAL_PHASE1' WHERE "id" = 'c1_50k' AND "externalReference" IS NULL;
+UPDATE "RuleTemplate" SET "externalReference" = 'PRIME_50K_EVAL_PHASE2' WHERE "id" = 'c2_50k' AND "externalReference" IS NULL;
 UPDATE "RuleTemplate" SET "externalReference" = 'PRIME_50K_FUND' WHERE "id" = 'f_50k' AND "externalReference" IS NULL;
 
 -- Link each Account to the tier whose rules it inherits.

@@ -179,8 +179,16 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
     num(raw["Daily. DD"]);
   const profitTarget =
     num(raw.profitTarget) ?? num(raw.profitTargetMoney) ?? num(raw.ProfitTgt) ?? num(raw["Profit Tgt"]);
-  const accountSize =
+  const accountSizeRaw =
     num(raw.startBalance) ?? num(raw.startingBalance) ?? num(raw.StartBalance);
+  // Volumetrica sometimes stores 500001 for "50k" eval display — keep Vault at 50k.
+  const accountSize =
+    accountSizeRaw != null &&
+    reference.toUpperCase().includes("50K") &&
+    accountSizeRaw >= 500_001 &&
+    accountSizeRaw <= 510_000
+      ? 50_000
+      : accountSizeRaw;
 
   const fields: Parameters<typeof upsertDxFeedRuleTemplate>[0]["fields"] = {};
   if (maxDrawdown != null) fields.maxDrawdown = maxDrawdown;

@@ -10,6 +10,7 @@ import {
   adminDeactivateSubscription,
   adminListRuleTemplates,
   deleteDxFeedRuleTemplateByRuleId,
+  migrateAccountsToPrimeTemplates,
   listDxFeedSyncedRuleIds,
 } from "../trading/admin-repository.js";
 import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
@@ -435,12 +436,14 @@ export async function handleDxFeedTradingRulesPull(
     const results = await syncTradingRulesFromBody({ data: rules });
     const synced = results.filter((r) => r.applied).length;
     noteTradingRulesFingerprintFromBody({ data: rules });
-    console.log(`[dxfeed trading-rules] pull ok — synced ${synced}/${results.length}`);
+    const remapped = synced > 0 ? await migrateAccountsToPrimeTemplates() : 0;
+    console.log(`[dxfeed trading-rules] pull ok — synced ${synced}/${results.length} remapped=${remapped}`);
     json(res, 200, {
       ok: true,
       pulled,
       deleted: missingRuleIds.length,
       synced,
+      remapped,
       results,
     });
   } catch (err) {

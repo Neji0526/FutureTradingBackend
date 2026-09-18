@@ -5,12 +5,8 @@ import { config } from "../config.js";
 /** Default evaluation parameters for a newly registered trader. */
 const STARTING_BALANCE = 50_000;
 const DEFAULT_RULE = { maxDailyLoss: 2_500, maxDrawdown: 3_000, profitTarget: 6_000, maxContracts: 5 };
-// Prefer dxFeed-synced References (same name as Volumetrica), then legacy seed ids.
-const DEFAULT_TIER_CANDIDATES = [
-  "PRIME_50K_EVAL_PHASE1",
-  "PRIME_50K_EVAL",
-  "c1_50k",
-];
+/** New accounts use dxFeed PRIME Phase 1 only (legacy seed ids are not preferred). */
+const DEFAULT_TIER_CANDIDATES = ["PRIME_50K_EVAL_PHASE1"];
 
 function evaluationTier(): string[] {
   const fromEnv = config.dxfeed.provisioning.ruleId.trim();
@@ -57,7 +53,7 @@ export async function createEvaluationAccount(userId: string, preferredTemplateI
       ...evaluationTier(),
     ];
 
-    // Prefer dxFeed-synced Phase 1 References / rule UUID, then legacy seed id.
+    // Prefer dxFeed-synced Phase 1 Reference / rule UUID.
     const tplRes = await client.query(
       `SELECT "id","phase","accountSize","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
               "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
