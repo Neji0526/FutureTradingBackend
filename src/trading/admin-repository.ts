@@ -747,6 +747,12 @@ export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
             "externalReference","syncedAt","updatedAt"
      FROM "RuleTemplate" ORDER BY "sortOrder"`,
   );
+  console.log(
+    `[dxfeed rules] GET RuleTemplate — count=${rows.length}` +
+      (rows.length
+        ? ` ids=[${rows.map((r) => String(r.id)).join(", ")}]`
+        : " (empty — sync via Volumetrica webhook or POST /api/dxfeed/trading-rules/pull)"),
+  );
   return rows.map((r) => ({
     id: r.id,
     label: r.label,
@@ -856,6 +862,7 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
   if (!existing.rows[0]) {
     const sort = await pool.query<{ n: number }>(`SELECT COALESCE(MAX("sortOrder"), 0) + 1 AS n FROM "RuleTemplate"`);
     const sortOrder = Number(sort.rows[0]?.n ?? 1);
+    console.log(`[dxfeed rules] CREATE RuleTemplate id=${templateId} label=${input.label || templateId}`);
     await pool.query(
       `INSERT INTO "RuleTemplate" (
          "id","label","phase","accountSize","sortOrder",
@@ -892,6 +899,7 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
       ],
     );
   } else {
+    console.log(`[dxfeed rules] UPDATE RuleTemplate id=${templateId} from reference=${id}`);
     await pool.query(
       `UPDATE "RuleTemplate"
        SET "label" = COALESCE(NULLIF($2, ''), "label"),

@@ -76,4 +76,20 @@ console.log("\ndxFeed trading-rules sync\n");
   console.log("  ✓ extract tradingRules[] including newly added refs");
 }
 
+{
+  const emptyNotify = extractTradingRulesFromBody({ category: 6, event: 1 });
+  assert(emptyNotify.length === 0, "bare TRADING_RULES notify must not invent a rule");
+  console.log("  ✓ bare category/event webhook extracts 0 (pull-fallback path)");
+}
+
+{
+  const nested = extractTradingRulesFromBody({
+    data: [{ Reference: "NESTED_50K", MaxDD: 2000, DailyDD: 1000, StartBalance: 50_000 }],
+  });
+  assert(nested.length === 1, `expected 1 nested rule, got ${nested.length}`);
+  const n = normalizeTradingRule(nested[0]!);
+  assert(n?.reference === "NESTED_50K", `ref ${n?.reference}`);
+  console.log("  ✓ extract data[] with PascalCase Admin columns");
+}
+
 console.log("\nAll trading-rules sync checks passed.\n");
