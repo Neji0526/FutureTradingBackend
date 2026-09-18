@@ -21,6 +21,7 @@ import {
 import {
   deleteDxFeedRuleTemplateByRuleId,
   listDxFeedSyncedRuleIds,
+  migrateAccountsToPrimeTemplates,
 } from "../trading/admin-repository.js";
 
 const POLL_MS = 60_000;
@@ -77,9 +78,9 @@ async function pollOnce(reason: string): Promise<void> {
     }
 
     const fp = fingerprintRules(parsed) + `|del:${missingRuleIds.slice().sort().join(",")}`;
-    if (fp === lastFingerprint) return;
+    const changed = fp !== lastFingerprint;
 
-    if (parsed.length > 0) {
+    if (changed && parsed.length > 0) {
       console.log(
         `[dxfeed rules] REST watch (${reason}) — change detected ` +
           `(${parsed.length} rule(s)); writing RuleTemplate`,
@@ -95,7 +96,15 @@ async function pollOnce(reason: string): Promise<void> {
       console.log(`[dxfeed rules] REST watch — applied ${applied}/${results.length}`);
     }
 
-    lastFingerprint = fp;
+    // Remap legacy seed accounts onto PRIME whenever catalog is present (no-op if already done).
+    if (rules.length > 0) {
+      const moved = await migrateAccountsToPrimeTemplates();
+      if (moved > 0) {
+        console.log(`[dxfeed rules] REST watch — remapped ${moved} account(s) onto PRIME templates`);
+      }
+    }
+
+    if (changed) lastFingerprint = fp;
   } catch (err) {
     console.warn(`[dxfeed rules] REST watch (${reason}) error:`, (err as Error).message);
   } finally {

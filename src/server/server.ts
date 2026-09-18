@@ -726,7 +726,7 @@ async function handleAdminRuleTemplateUpdate(url: URL, req: IncomingMessage, res
   json(res, 403, {
     ok: false,
     error:
-      "Rule templates are managed in dxFeed / Volumetrica Admin. Edit them there; changes sync via webhook into RuleTemplate and cascade to accounts.",
+      "Rule templates are managed in dxFeed / Volumetrica Admin (PRIME_50K_*). Edit them there; REST sync updates RuleTemplate and cascades to accounts.",
   });
 }
 
