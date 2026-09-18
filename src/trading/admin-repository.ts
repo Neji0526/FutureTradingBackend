@@ -698,7 +698,7 @@ export async function adminUpdateRule(
   }
   if (Array.isArray(fields.allowedInstruments)) {
     const list = fields.allowedInstruments.filter((s) => typeof s === "string");
-    cols.push(`"allowedInstruments" = $${vals.length + 1}`);
+    cols.push(`"allowedInstruments" = $${vals.length + 1}::text[]`);
     vals.push(list);
   }
   if (cols.length === 0) return false;
@@ -812,7 +812,7 @@ export async function adminUpdateRuleTemplate(id: string, fields: TemplateFields
   }
   if (Array.isArray(fields.allowedInstruments)) {
     const list = fields.allowedInstruments.filter((s) => typeof s === "string");
-    cols.push(`"allowedInstruments" = $${vals.length + 1}`);
+    cols.push(`"allowedInstruments" = $${vals.length + 1}::text[]`);
     vals.push(list);
   }
   if (cols.length === 0) return false;
@@ -904,6 +904,8 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
     );
   } else {
     console.log(`[dxfeed rules] UPDATE RuleTemplate id=${templateId} from reference=${id}`);
+    // Params must be contiguous from $1 — skipping $1 causes Postgres
+    // "could not determine data type of parameter $1".
     await pool.query(
       `UPDATE "RuleTemplate"
        SET "label" = COALESCE(NULLIF($2, ''), "label"),
@@ -913,8 +915,8 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
            "source" = 'dxfeed',
            "syncedAt" = now(),
            "updatedAt" = now()
-       WHERE "id" = $6`,
-      [id, input.label || id, input.phase, input.accountSize > 0 ? input.accountSize : 0, dxRuleId, templateId],
+       WHERE "id" = $1`,
+      [templateId, input.label || id, input.phase, input.accountSize > 0 ? input.accountSize : 0, dxRuleId],
     );
   }
 
