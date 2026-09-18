@@ -380,17 +380,21 @@ export async function handleDxFeedTradingRulesUpsert(
   }
 
   const body = (await readJson<unknown>(req)) ?? {};
+  console.log("[dxfeed trading-rules] POST upsert received");
   try {
     const results = await syncTradingRulesFromBody(body);
     if (results.length === 0) {
+      console.warn("[dxfeed trading-rules] upsert found 0 rules in body");
       json(res, 400, {
         error: "No trading rules found in body. Send tradingRule, tradingRules[], or a Reference object.",
       });
       return;
     }
+    const synced = results.filter((r) => r.applied).length;
+    console.log(`[dxfeed trading-rules] upsert ok — synced ${synced}/${results.length}`);
     json(res, 200, {
       ok: true,
-      synced: results.filter((r) => r.applied).length,
+      synced,
       results,
     });
   } catch (err) {
@@ -415,13 +419,18 @@ export async function handleDxFeedTradingRulesPull(
     return;
   }
 
+  console.log("[dxfeed trading-rules] POST pull — fetching GetTradingRules/GetAccountRules");
   try {
     const remote = await propfirm.getTradingRules();
+    const pulled = Array.isArray(remote) ? remote.length : remote ? 1 : 0;
+    console.log(`[dxfeed trading-rules] pull remote count=${pulled}`);
     const results = await syncTradingRulesFromBody({ data: remote });
+    const synced = results.filter((r) => r.applied).length;
+    console.log(`[dxfeed trading-rules] pull ok — synced ${synced}/${results.length}`);
     json(res, 200, {
       ok: true,
-      pulled: Array.isArray(remote) ? remote.length : 1,
-      synced: results.filter((r) => r.applied).length,
+      pulled,
+      synced,
       results,
     });
   } catch (err) {
@@ -448,6 +457,7 @@ export async function handlePublicTradingRules(
   }
   try {
     const templates = await adminListRuleTemplates();
+    console.log(`[dxfeed rules] GET /api/trading-rules — returning ${templates.length} template(s)`);
     json(res, 200, {
       ok: true,
       source: "vault",

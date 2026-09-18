@@ -15,6 +15,7 @@ export type DxFeedTradingRulePayload = {
   Reference?: string | null;
   id?: string | null;
   ruleId?: string | null;
+  RuleId?: string | null;
   description?: string | null;
   Description?: string | null;
   startBalance?: number | string | null;
@@ -150,8 +151,9 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
   const referenceRaw =
     str(raw.reference) ??
     str(raw.Reference) ??
-    str(raw.id) ??
-    str(raw.ruleId);
+    str(raw.ruleId) ??
+    str(raw.RuleId) ??
+    str(raw.id);
   if (!referenceRaw) return null;
 
   const reference = resolveTemplateId(referenceRaw);
@@ -216,10 +218,12 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
 export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Promise<SyncResult> {
   const normalized = normalizeTradingRule(raw);
   if (!normalized) {
+    console.warn("[dxfeed rules] skip payload — missing Reference/reference/ruleId", summarizeRuleKeys(raw));
     return { reference: "?", templateId: null, applied: false, reason: "missing reference" };
   }
 
   if (!useDatabase) {
+    console.warn(`[dxfeed rules] skip ${normalized.reference} — database not configured`);
     return {
       reference: normalized.reference,
       templateId: normalized.reference,
@@ -238,7 +242,8 @@ export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Pro
     });
 
     console.log(
-      `[dxfeed rules] upserted ${normalized.reference} → ${templateId}` +
+      `[dxfeed rules] upserted ${normalized.reference} → RuleTemplate.id=${templateId}` +
+        ` phase=${normalized.phase}` +
         ` fields=${Object.keys(normalized.fields).join(",") || "(meta)"}`,
     );
 
@@ -254,36 +259,107 @@ export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Pro
   }
 }
 
+function summarizeRuleKeys(raw: unknown): string {
+  if (!raw || typeof raw !== "object") return typeof raw;
+  return Object.keys(raw as object).slice(0, 20).join(",");
+}
+
+function looksLikeTradingRule(x: unknown): x is DxFeedTradingRulePayload {
+  if (!x || typeof x !== "object") return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o.reference === "string" ||
+    typeof o.Reference === "string" ||
+    typeof o.ruleId === "string" ||
+    typeof o.RuleId === "string" ||
+    typeof o.id === "string" ||
+    o.MaxDD != null ||
+    o.maxDrawdown != null ||
+    o.StartBalance != null ||
+    o.startBalance != null
+  );
+}
+
+function pushRuleCandidate(bag: unknown[], item: unknown): void {
+  if (!item) return;
+  if (Array.isArray(item)) {
+    for (const x of item) pushRuleCandidate(bag, x);
+    return;
+  }
+  if (typeof item !== "object") return;
+  const o = item as Record<string, unknown>;
+  // Nested wrappers Volumetrica sometimes uses around a single rule.
+  if (o.tradingRule && typeof o.tradingRule === "object") bag.push(o.tradingRule);
+  if (o.accountRule && typeof o.accountRule === "object") bag.push(o.accountRule);
+  if (o.AccountRule && typeof o.AccountRule === "object") bag.push(o.AccountRule);
+  if (o.rule && typeof o.rule === "object") bag.push(o.rule);
+  if (looksLikeTradingRule(item)) bag.push(item);
+}
+
 /** Extract zero-or-more rule objects from a webhook / REST body. */
 export function extractTradingRulesFromBody(body: unknown): DxFeedTradingRulePayload[] {
   if (!body || typeof body !== "object") return [];
   const o = body as Record<string, unknown>;
 
   const bag: unknown[] = [];
-  if (o.tradingRule && typeof o.tradingRule === "object") bag.push(o.tradingRule);
-  if (o.accountRule && typeof o.accountRule === "object") bag.push(o.accountRule);
-  if (o.rule && typeof o.rule === "object") bag.push(o.rule);
-  if (Array.isArray(o.tradingRules)) bag.push(...o.tradingRules);
-  if (Array.isArray(o.rules)) bag.push(...o.rules);
-  if (Array.isArray(o.data)) bag.push(...o.data);
+  pushRuleCandidate(bag, o.tradingRule);
+  pushRuleCandidate(bag, o.accountRule);
+  pushRuleCandidate(bag, o.AccountRule);
+  pushRuleCandidate(bag, o.rule);
+  pushRuleCandidate(bag, o.tradingRules);
+  pushRuleCandidate(bag, o.accountRules);
+  pushRuleCandidate(bag, o.AccountRules);
+  pushRuleCandidate(bag, o.rules);
+  pushRuleCandidate(bag, o.items);
+  pushRuleCandidate(bag, o.data);
+  pushRuleCandidate(bag, o.payload);
+  pushRuleCandidate(bag, o.content);
+  pushRuleCandidate(bag, o.result);
 
-  if (
-    bag.length === 0 &&
-    (typeof o.reference === "string" ||
+  // Top-level rule object (Reference / MaxDD / …) with no wrapper key.
+  // Skip bare webhook shells that only have category/event and no rule fields.
+  if (bag.length === 0) {
+    const hasRef =
+      typeof o.reference === "string" ||
       typeof o.Reference === "string" ||
-      typeof o.ruleId === "string")
-  ) {
-    bag.push(o);
+      typeof o.ruleId === "string" ||
+      typeof o.RuleId === "string";
+    const hasLimits = o.MaxDD != null || o.maxDrawdown != null || o.StartBalance != null || o.startBalance != null;
+    if (hasRef || hasLimits) bag.push(o);
   }
 
-  return bag.filter((x): x is DxFeedTradingRulePayload => Boolean(x) && typeof x === "object");
+  // Deduplicate by reference when the same rule appears nested twice.
+  const out: DxFeedTradingRulePayload[] = [];
+  const seen = new Set<string>();
+  for (const x of bag) {
+    if (!looksLikeTradingRule(x)) continue;
+    const key =
+      str(x.reference) ??
+      str(x.Reference) ??
+      str(x.ruleId) ??
+      str(x.RuleId) ??
+      str(x.id) ??
+      JSON.stringify(x).slice(0, 80);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(x);
+  }
+  return out;
 }
 
 export async function syncTradingRulesFromBody(body: unknown): Promise<SyncResult[]> {
   const rules = extractTradingRulesFromBody(body);
+  console.log(
+    `[dxfeed rules] sync start — extracted ${rules.length} rule(s)` +
+      (rules.length
+        ? ` refs=[${rules.map((r) => str(r.reference) ?? str(r.Reference) ?? str(r.ruleId) ?? "?").join(", ")}]`
+        : ` bodyKeys=[${summarizeRuleKeys(body)}]`),
+  );
   const out: SyncResult[] = [];
   for (const r of rules) {
     out.push(await applyDxFeedTradingRule(r));
   }
+  const applied = out.filter((r) => r.applied).length;
+  console.log(`[dxfeed rules] sync done — applied ${applied}/${out.length}`);
   return out;
 }
