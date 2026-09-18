@@ -229,6 +229,7 @@ function printLiveTable(providerName: string, rows: MarketLiveRow[]): void {
       `exchanges=${ex}  candleEntitled=${feed.candleEntitled === null ? "?" : feed.candleEntitled}`,
     );
   }
+
   lines.push(
     pad("SYM", 5) +
       pad("STATE", 9) +
@@ -238,6 +239,7 @@ function printLiveTable(providerName: string, rows: MarketLiveRow[]): void {
       pad("AGE", 7) +
       "REASON",
   );
+  
   lines.push("-".repeat(100));
   for (const r of rows) {
     lines.push(
