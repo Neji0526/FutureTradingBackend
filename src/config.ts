@@ -89,7 +89,7 @@ export const config = {
     provisioning: {
       balance: num("DXFEED_DEFAULT_BALANCE", 50_000),
       ruleId: process.env.DXFEED_DEFAULT_RULE_ID?.trim() ?? "",
-      dataFeedProducts: (process.env.DXFEED_DATA_PRODUCTS?.trim() || "0")
+      dataFeedProducts: (process.env.DXFEED_DATA_PRODUCTS?.trim() || "0,1,2,3")
         .split(",")
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isFinite(n)),

@@ -26,12 +26,13 @@ export class PropfirmClient {
     private readonly apiKey: string = config.dxfeed.apiKey,
   ) {}
 
-  private async call<T>(
-    action: string,
+  private async request<T>(
+    path: string,
+    actionLabel: string,
     opts: { method?: "GET" | "POST"; query?: Query; body?: unknown } = {},
   ): Promise<T> {
     const method = opts.method ?? (opts.body ? "POST" : "GET");
-    const url = new URL(`/api/Propsite/${action}`, this.baseUrl);
+    const url = new URL(path, this.baseUrl);
     for (const [k, v] of Object.entries(opts.query ?? {})) {
       if (v !== undefined) url.searchParams.set(k, String(v));
     }
@@ -46,7 +47,7 @@ export class PropfirmClient {
     });
 
     const text = await res.text();
-    if (!res.ok) throw new DxFeedApiError(action, res.status, text);
+    if (!res.ok) throw new DxFeedApiError(actionLabel, res.status, text);
 
     if (!text) return undefined as T;
     const json = JSON.parse(text) as unknown;
@@ -54,6 +55,26 @@ export class PropfirmClient {
       return (json as { data: T }).data;
     }
     return json as T;
+  }
+
+  /** Propfirm API V1 — default for all account/user/subscription actions. */
+  private async call<T>(
+    action: string,
+    opts: { method?: "GET" | "POST"; query?: Query; body?: unknown } = {},
+  ): Promise<T> {
+    return this.request<T>(`/api/Propsite/${action}`, action, opts);
+  }
+
+  /**
+   * Propfirm API V2 — used only where V1 has no equivalent (TradingRule/List).
+   * Do not migrate other actions to V2 without an explicit product decision.
+   */
+  private async callV2<T>(
+    path: string,
+    opts: { method?: "GET" | "POST"; query?: Query; body?: unknown } = {},
+  ): Promise<T> {
+    const label = `v2/${path}`;
+    return this.request<T>(`/api/v2/Propsite/${path}`, label, opts);
   }
 
   newUser(input: NewUserInput): Promise<UserResult> {
@@ -120,20 +141,84 @@ export class PropfirmClient {
     return this.call<unknown>("ActiveSubscription", { query: { subscriptionId } });
   }
 
-  /**
-   * Best-effort list of org Trading Rules from Volumetrica Admin.
-   * Action name varies by Propsite build — try GetTradingRules then GetAccountRules.
-   */
-  async getTradingRules(): Promise<unknown> {
-    try {
-      return await this.call<unknown>("GetTradingRules");
-    } catch (err) {
-      if (err instanceof DxFeedApiError && (err.status === 404 || err.status === 400)) {
-        return this.call<unknown>("GetAccountRules");
-      }
-      throw err;
-    }
+  /** Active trading account ids (Propsite GetEnabledAccountsId). */
+  getEnabledAccountsId(): Promise<string[]> {
+    return this.call<string[]>("GetEnabledAccountsId");
   }
+
+  getAccountInfo(accountId: string): Promise<{ tradingRuleId?: string | null }> {
+    return this.call<{ tradingRuleId?: string | null }>("GetAccountInfo", {
+      query: { accountId },
+    });
+  }
+
+  /** Single global/account trading rule by Volumetrica rule UUID (V1). */
+  getTradingRule(ruleId: string): Promise<Record<string, unknown>> {
+    return this.call<Record<string, unknown>>("GetTradingRule", { query: { ruleId } });
+  }
+
+  /**
+   * All organization trading rules (Propfirm API V2 only).
+   * GET /api/v2/Propsite/TradingRule/List — V1 has no list endpoint.
+   */
+  async listTradingRules(opts: { skip?: number; take?: number } = {}): Promise<Record<string, unknown>[]> {
+    const skip = opts.skip ?? -1;
+    const take = opts.take ?? -1;
+    const table = await this.callV2<{
+      data?: unknown;
+      recordsTotal?: number;
+      recordsFiltered?: number;
+    }>("TradingRule/List", { query: { skip, take } });
+
+    const rows = unwrapTradingRuleListRows(table);
+    return rows.map((rule) => {
+      const ruleId = typeof rule.ruleId === "string" ? rule.ruleId : undefined;
+      return ruleId ? { ...rule, ruleId } : rule;
+    });
+  }
+
+  /**
+   * REST auto-sync source: V2 TradingRule/List (full catalog).
+   * `previouslySyncedRuleIds` marks Vault templates whose dx rule UUID is no longer listed (deleted upstream).
+   */
+  async fetchTradingRulesFromRest(previouslySyncedRuleIds: string[] = []): Promise<{
+    rules: Record<string, unknown>[];
+    missingRuleIds: string[];
+  }> {
+    const rules = await this.listTradingRules();
+    const listedIds = new Set<string>();
+    for (const rule of rules) {
+      const rid = typeof rule.ruleId === "string" ? rule.ruleId.trim() : "";
+      if (rid) listedIds.add(rid);
+    }
+
+    const missingRuleIds: string[] = [];
+    for (const id of previouslySyncedRuleIds) {
+      const t = id?.trim();
+      if (t && !listedIds.has(t)) missingRuleIds.push(t);
+    }
+
+    return { rules, missingRuleIds };
+  }
+
+  /** @deprecated Prefer fetchTradingRulesFromRest (V2 TradingRule/List). */
+  async getTradingRules(): Promise<unknown> {
+    const { rules } = await this.fetchTradingRulesFromRest();
+    return rules;
+  }
+}
+
+/** Normalize V2 DataTable payload: `{ data: Rule[] }` or a bare Rule[]. */
+function unwrapTradingRuleListRows(table: unknown): Record<string, unknown>[] {
+  if (Array.isArray(table)) {
+    return table.filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object");
+  }
+  if (!table || typeof table !== "object") return [];
+  const nested = (table as { data?: unknown }).data;
+  if (Array.isArray(nested)) {
+    return nested.filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object");
+  }
+  return [];
 }
 
 export const propfirm = new PropfirmClient();

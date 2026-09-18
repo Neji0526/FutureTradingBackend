@@ -117,6 +117,12 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   }
 
   if (!link.dxAccountId) {
+    if (!ruleId) {
+      console.warn(
+        "[dxfeed] DXFEED_DEFAULT_RULE_ID unset — CreateTradingAccount without accountRuleId. " +
+          "Set it to the Volumetrica Trading Rule UUID from Admin (guide: use rule ID via API).",
+      );
+    }
     const acct = await propfirm.createTradingAccount({
       userId: link.dxUserId,
       balance: p.balance,
@@ -124,11 +130,28 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
       enabled: true,
       mode: AccountMode.EVALUATION,
       description: `Vault ${input.orderNumber}`,
-      ...(ruleId ? { accountRuleReference: IdReference.APPLICATION, accountRuleId: ruleId } : {}),
+      // Organization-level Admin / sheet templates (organizationReferenceId).
+      ...(ruleId
+        ? { accountRuleReference: IdReference.ORGANIZATION, accountRuleId: ruleId }
+        : {}),
     });
     if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
     link.dxAccountId = acct.accountId;
     await upsertDxFeedLink(link);
+
+    // Mirror that rule into Vault RuleTemplate via REST (not webhook).
+    const syncId = (acct.tradingRuleId ?? ruleId)?.trim();
+    if (syncId) {
+      const { syncTradingRuleById } = await import("./trading-rules-sync.js");
+      const synced = await syncTradingRuleById(syncId);
+      if (synced.applied) {
+        console.log(
+          `[dxfeed] provision synced RuleTemplate ${synced.templateId} from ruleId=${syncId}`,
+        );
+      } else {
+        console.warn(`[dxfeed] provision rule sync skipped: ${synced.reason ?? "unknown"}`);
+      }
+    }
   }
 
   if (!link.dxSubscriptionId) {

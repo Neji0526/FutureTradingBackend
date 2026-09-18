@@ -5,14 +5,8 @@ import {
   getLinkBySubscriptionId,
   upsertDxFeedLink,
 } from "./store.js";
-import { propfirm } from "./propfirm.js";
 import { AccountStatus } from "./types.js";
-import {
-  dxFeedApiKeyOk,
-  extractTradingRulesFromBody,
-  syncTradingRulesFromBody,
-} from "./trading-rules-sync.js";
-import { noteTradingRulesFingerprintFromBody } from "./trading-rules-watch.js";
+import { dxFeedApiKeyOk } from "./trading-rules-sync.js";
 
 export const NotificationCategory = {
   ACCOUNTS: 0,
@@ -21,7 +15,6 @@ export const NotificationCategory = {
   TRADE_REPORT: 3,
   PORTFOLIO: 4,
   ORG_USER: 5,
-  /** Volumetrica Trading Rules admin changes (or custom webhook category). */
   TRADING_RULES: 6,
 } as const;
 
@@ -41,17 +34,13 @@ interface WebhookEvent {
     dxAgreementSigned?: boolean;
     dxAgreementLink?: string | null;
   } | null;
-  tradingRule?: unknown;
-  tradingRules?: unknown;
-  rules?: unknown;
 }
 
 export interface WebhookResult { status: number; note: string }
 
 /**
- * Volumetrica webhook — authenticated with DXFEED_API_KEY (x-api-key).
- * Must 200 on processing errors so their queue is not blocked.
- * 401 only when the key is missing/wrong (never process unauthenticated).
+ * Volumetrica webhook — accounts / subscriptions only.
+ * Trading-rule sync is REST auto-watch (V2 TradingRule/List), not webhook.
  */
 export async function handleDxFeedWebhook(apiKey: string | undefined, body: unknown): Promise<WebhookResult> {
   if (!config.dxfeed.apiKey || !dxFeedApiKeyOk(apiKey)) {
@@ -62,10 +51,13 @@ export async function handleDxFeedWebhook(apiKey: string | undefined, body: unkn
     const ev = (body ?? {}) as WebhookEvent;
     const keys = body && typeof body === "object" ? Object.keys(body as object).join(",") : typeof body;
     console.log(`[dxfeed webhook] recv category=${ev.category} event=${ev.event} keys=[${keys}]`);
-    if (body && typeof body === "object") {
-      console.log("[dxfeed webhook] body:", JSON.stringify(body));
+    if (ev.category === NotificationCategory.TRADING_RULES) {
+      console.log(
+        "[dxfeed webhook] ignoring Trading Rules category — RuleTemplate sync uses REST watch only",
+      );
+      return { status: 200, note: "trading-rules ignored (REST watch)" };
     }
-    await dispatch(ev, body);
+    await dispatch(ev);
     return { status: 200, note: `category=${ev.category} event=${ev.event}` };
   } catch (err) {
     console.warn("[dxfeed webhook] processing error (ack 200 anyway):", (err as Error).message);
@@ -73,42 +65,7 @@ export async function handleDxFeedWebhook(apiKey: string | undefined, body: unkn
   }
 }
 
-async function dispatch(ev: WebhookEvent, rawBody: unknown): Promise<void> {
-  // Trading-rule payloads may arrive as category=6 OR as a body that simply
-  // contains tradingRule(s) — accept both so Admin rule edits always land.
-  const rulePayloads = extractTradingRulesFromBody(rawBody);
-  if (ev.category === NotificationCategory.TRADING_RULES || rulePayloads.length > 0) {
-    if (rulePayloads.length > 0) {
-      const results = await syncTradingRulesFromBody(rawBody);
-      const ok = results.filter((r) => r.applied).length;
-      noteTradingRulesFingerprintFromBody(rawBody);
-      console.log(`[dxfeed webhook] trading rules synced ${ok}/${results.length}`);
-    } else if (ev.category === NotificationCategory.TRADING_RULES) {
-      // Volumetrica often notifies "rule changed" without embedding the rule.
-      // Pull the full list so wiped RuleTemplate rows are recreated on update.
-      console.warn(
-        "[dxfeed webhook] TRADING_RULES with no parseable rule body — pulling GetTradingRules/GetAccountRules",
-      );
-      try {
-        const remote = await propfirm.getTradingRules();
-        const wrapped = { data: remote };
-        const results = await syncTradingRulesFromBody(wrapped);
-        const ok = results.filter((r) => r.applied).length;
-        noteTradingRulesFingerprintFromBody(wrapped);
-        console.log(`[dxfeed webhook] trading rules pull-fallback synced ${ok}/${results.length}`);
-      } catch (err) {
-        console.warn(
-          "[dxfeed webhook] trading rules pull-fallback failed:",
-          (err as Error).message,
-          "— watch will retry on next poll if DXFEED_API_KEY is set",
-        );
-      }
-    }
-    if (ev.category === NotificationCategory.TRADING_RULES) return;
-    // If category was something else but body also carried rules, fall through
-    // so account/subscription updates still process.
-  }
-
+async function dispatch(ev: WebhookEvent): Promise<void> {
   switch (ev.category) {
     case NotificationCategory.ACCOUNTS: {
       const accountId = ev.accountId ?? ev.tradingAccount?.id ?? null;

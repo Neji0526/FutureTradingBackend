@@ -1,9 +1,13 @@
 /**
- * Watch Volumetrica Trading Rules and write RuleTemplate only when content changes.
+ * REST auto-sync of Volumetrica Trading Rules → RuleTemplate.
  *
- * Uses existing DXFEED_API_KEY + DATABASE_URL (no new env vars).
- * Does not delete templates; upserts by Reference name when a change is detected.
- * Webhook path still works; this covers orgs where Trading Rules webhooks never fire.
+ * Does NOT use webhooks for rules. Polls Propfirm API V2 only for the catalog:
+ *   GET /api/v2/Propsite/TradingRule/List
+ * (all other Propsite actions stay on V1.)
+ *
+ * Writes RuleTemplate only when remote content changes (add/update).
+ * Removes dxFeed-sourced templates when a previously synced rule UUID
+ * is no longer returned by TradingRule/List (delete).
  */
 import { createHash } from "node:crypto";
 import { config, useDatabase } from "../config.js";
@@ -14,8 +18,11 @@ import {
   syncTradingRulesFromBody,
   type DxFeedTradingRulePayload,
 } from "./trading-rules-sync.js";
+import {
+  deleteDxFeedRuleTemplateByRuleId,
+  listDxFeedSyncedRuleIds,
+} from "../trading/admin-repository.js";
 
-/** How often to check Volumetrica for rule edits (fixed — no extra env). */
 const POLL_MS = 60_000;
 
 let lastFingerprint = "";
@@ -28,6 +35,7 @@ function fingerprintRules(rules: DxFeedTradingRulePayload[]): string {
     .filter((n): n is NonNullable<typeof n> => Boolean(n))
     .map((n) => ({
       reference: n.reference,
+      dxRuleId: n.dxRuleId ?? "",
       label: n.label ?? "",
       phase: n.phase,
       accountSize: n.accountSize ?? 0,
@@ -37,7 +45,7 @@ function fingerprintRules(rules: DxFeedTradingRulePayload[]): string {
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
-/** Call after a webhook/REST sync so the watcher does not immediately re-apply the same set. */
+/** Keep watch fingerprint in sync after a manual REST pull/upsert. */
 export function noteTradingRulesFingerprintFromBody(body: unknown): void {
   const rules = extractTradingRulesFromBody(body);
   if (rules.length === 0) return;
@@ -48,64 +56,72 @@ async function pollOnce(reason: string): Promise<void> {
   if (inflight) return;
   inflight = true;
   try {
-    const remote = await propfirm.getTradingRules();
-    const wrapped = { data: remote };
-    const rules = extractTradingRulesFromBody(wrapped);
-    if (rules.length === 0) {
-      console.warn(
-        `[dxfeed rules] watch (${reason}) — remote returned 0 parseable rules; RuleTemplate unchanged`,
-      );
+    const knownIds = useDatabase ? await listDxFeedSyncedRuleIds() : [];
+    const { rules, missingRuleIds } = await propfirm.fetchTradingRulesFromRest(knownIds);
+
+    for (const missing of missingRuleIds) {
+      if (!useDatabase) break;
+      await deleteDxFeedRuleTemplateByRuleId(missing);
+    }
+
+    const wrapped = { data: rules };
+    const parsed = extractTradingRulesFromBody(wrapped);
+    if (parsed.length === 0 && missingRuleIds.length === 0) {
+      if (reason === "startup") {
+        console.warn(
+          "[dxfeed rules] REST watch — 0 rules from V2 TradingRule/List. " +
+            "Confirm DXFEED_API_KEY can read organization trading rules.",
+        );
+      }
       return;
     }
 
-    const fp = fingerprintRules(rules);
-    if (fp === lastFingerprint) {
-      return; // no change on Volumetrica — stay quiet
+    const fp = fingerprintRules(parsed) + `|del:${missingRuleIds.slice().sort().join(",")}`;
+    if (fp === lastFingerprint) return;
+
+    if (parsed.length > 0) {
+      console.log(
+        `[dxfeed rules] REST watch (${reason}) — change detected ` +
+          `(${parsed.length} rule(s)); writing RuleTemplate`,
+      );
+      console.log(
+        "[dxfeed rules] REST refs:",
+        parsed
+          .map((r) => r.organizationReferenceId ?? r.reference ?? r.Reference ?? r.ruleId ?? "?")
+          .join(", "),
+      );
+      const results = await syncTradingRulesFromBody(wrapped);
+      const applied = results.filter((r) => r.applied).length;
+      console.log(`[dxfeed rules] REST watch — applied ${applied}/${results.length}`);
     }
 
-    console.log(
-      `[dxfeed rules] watch (${reason}) — Volumetrica rules changed ` +
-        `(${rules.length} rule(s)); writing RuleTemplate`,
-    );
-    console.log(
-      "[dxfeed rules] watch refs:",
-      rules.map((r) => r.reference ?? r.Reference ?? r.ruleId ?? r.RuleId ?? "?").join(", "),
-    );
-
-    const results = await syncTradingRulesFromBody(wrapped);
-    const applied = results.filter((r) => r.applied).length;
     lastFingerprint = fp;
-    console.log(`[dxfeed rules] watch — RuleTemplate sync applied ${applied}/${results.length}`);
   } catch (err) {
-    console.warn(`[dxfeed rules] watch (${reason}) error:`, (err as Error).message);
+    console.warn(`[dxfeed rules] REST watch (${reason}) error:`, (err as Error).message);
   } finally {
     inflight = false;
   }
 }
 
-/**
- * Start background watch: sync RuleTemplate only when Volumetrica trading rules change.
- * No-op without database + DXFEED_API_KEY.
- */
+/** Start REST polling auto-sync (no webhook). */
 export function startTradingRulesWatch(): () => void {
   if (!useDatabase) {
-    console.log("[dxfeed rules] watch off — DATABASE_URL not set");
+    console.log("[dxfeed rules] REST watch off — DATABASE_URL not set");
     return () => {};
   }
   if (!config.dxfeed.apiKey) {
-    console.log("[dxfeed rules] watch off — DXFEED_API_KEY not set");
+    console.log("[dxfeed rules] REST watch off — DXFEED_API_KEY not set");
     return () => {};
   }
   if (timer) return () => stopTradingRulesWatch();
 
   console.log(
-    `[dxfeed rules] watch on — check every ${POLL_MS / 1000}s; ` +
-      "RuleTemplate updated only when Volumetrica rules change (no DXFEED_RULE_MAP)",
+    `[dxfeed rules] REST watch on — every ${POLL_MS / 1000}s via V2 TradingRule/List ` +
+      "(not webhook); sync RuleTemplate on add/update/delete",
   );
 
   void pollOnce("startup");
   timer = setInterval(() => void pollOnce("poll"), POLL_MS);
-
   return () => stopTradingRulesWatch();
 }
 

@@ -833,8 +833,10 @@ export async function adminUpdateRuleTemplate(id: string, fields: TemplateFields
 }
 
 export type UpsertDxFeedTemplateInput = {
-  /** Same as Volumetrica Reference — used as RuleTemplate.id */
+  /** Same as Volumetrica organizationReferenceId — used as RuleTemplate.id */
   reference: string;
+  /** Volumetrica rule UUID from TradingRule/List — stored in externalReference for REST re-poll */
+  dxRuleId?: string;
   label: string;
   phase: string;
   accountSize: number;
@@ -847,15 +849,16 @@ export type UpsertDxFeedTemplateInput = {
  */
 export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput): Promise<string> {
   const id = input.reference.trim();
+  const dxRuleId = input.dxRuleId?.trim() || id;
   const pool = getPool();
 
-  // Prefer an existing row already linked to this Reference (legacy c1_50k, etc.).
+  // Prefer an existing row already linked to this Reference or Volumetrica rule UUID.
   const existing = await pool.query<{ id: string }>(
     `SELECT "id" FROM "RuleTemplate"
-     WHERE "id" = $1 OR "externalReference" = $1
-     ORDER BY CASE WHEN "id" = $1 THEN 0 ELSE 1 END
+     WHERE "id" = $1 OR "externalReference" = $1 OR "externalReference" = $2 OR "id" = $2
+     ORDER BY CASE WHEN "id" = $1 THEN 0 WHEN "externalReference" = $2 THEN 1 ELSE 2 END
      LIMIT 1`,
-    [id],
+    [id, dxRuleId],
   );
   const templateId = existing.rows[0]?.id ?? id;
 
@@ -875,7 +878,7 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
          $6,$7,$8,$9,
          $10,$11,$12,$13,
          $14,$15,$16,$17,
-         $18,'{}',$1,'dxfeed',now(),now()
+         $18,'{}',$19,'dxfeed',now(),now()
        )`,
       [
         templateId,
@@ -896,6 +899,7 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
         input.fields.overnightHoldsProhibited ?? true,
         input.fields.weekendHoldsProhibited ?? true,
         input.fields.drawdownType === "EOD" ? "EOD" : "INTRADAY",
+        dxRuleId,
       ],
     );
   } else {
@@ -905,12 +909,12 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
        SET "label" = COALESCE(NULLIF($2, ''), "label"),
            "phase" = $3,
            "accountSize" = CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE "accountSize" END,
-           "externalReference" = $1,
+           "externalReference" = $5,
            "source" = 'dxfeed',
            "syncedAt" = now(),
            "updatedAt" = now()
-       WHERE "id" = $5`,
-      [id, input.label || id, input.phase, input.accountSize > 0 ? input.accountSize : 0, templateId],
+       WHERE "id" = $6`,
+      [id, input.label || id, input.phase, input.accountSize > 0 ? input.accountSize : 0, dxRuleId, templateId],
     );
   }
 
@@ -921,10 +925,44 @@ export async function upsertDxFeedRuleTemplate(input: UpsertDxFeedTemplateInput)
     await pool.query(
       `UPDATE "RuleTemplate" SET "source" = 'dxfeed', "externalReference" = $2, "syncedAt" = now(), "updatedAt" = now()
        WHERE "id" = $1`,
-      [templateId, id],
+      [templateId, dxRuleId],
     );
   }
 
+  return templateId;
+}
+
+/** Volumetrica rule UUIDs previously synced (for REST re-poll + delete detection). */
+export async function listDxFeedSyncedRuleIds(): Promise<string[]> {
+  const { rows } = await getPool().query<{ externalReference: string | null; id: string }>(
+    `SELECT "id", "externalReference" FROM "RuleTemplate" WHERE "source" = 'dxfeed'`,
+  );
+  const out: string[] = [];
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  for (const r of rows) {
+    if (r.externalReference && uuidRe.test(r.externalReference)) out.push(r.externalReference);
+    else if (uuidRe.test(r.id)) out.push(r.id);
+  }
+  return out;
+}
+
+/** Soft-remove a dxFeed-synced template when V2 TradingRule/List no longer returns the rule UUID. */
+export async function deleteDxFeedRuleTemplateByRuleId(dxRuleId: string): Promise<string | null> {
+  const id = dxRuleId.trim();
+  if (!id) return null;
+  const pool = getPool();
+  const { rows } = await pool.query<{ id: string }>(
+    `SELECT "id" FROM "RuleTemplate"
+     WHERE "source" = 'dxfeed' AND ("externalReference" = $1 OR "id" = $1)
+     LIMIT 1`,
+    [id],
+  );
+  const templateId = rows[0]?.id;
+  if (!templateId) return null;
+  // Unlink accounts first (FK), then remove dxFeed-owned row only.
+  await pool.query(`UPDATE "Account" SET "ruleTemplateId" = NULL WHERE "ruleTemplateId" = $1`, [templateId]);
+  await pool.query(`DELETE FROM "RuleTemplate" WHERE "id" = $1 AND "source" = 'dxfeed'`, [templateId]);
+  console.log(`[dxfeed rules] DELETE RuleTemplate id=${templateId} (Volumetrica rule ${id} gone)`);
   return templateId;
 }
 
