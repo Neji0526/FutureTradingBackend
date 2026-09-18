@@ -12,6 +12,7 @@ import {
   extractTradingRulesFromBody,
   syncTradingRulesFromBody,
 } from "./trading-rules-sync.js";
+import { noteTradingRulesFingerprintFromBody } from "./trading-rules-watch.js";
 
 export const NotificationCategory = {
   ACCOUNTS: 0,
@@ -80,6 +81,7 @@ async function dispatch(ev: WebhookEvent, rawBody: unknown): Promise<void> {
     if (rulePayloads.length > 0) {
       const results = await syncTradingRulesFromBody(rawBody);
       const ok = results.filter((r) => r.applied).length;
+      noteTradingRulesFingerprintFromBody(rawBody);
       console.log(`[dxfeed webhook] trading rules synced ${ok}/${results.length}`);
     } else if (ev.category === NotificationCategory.TRADING_RULES) {
       // Volumetrica often notifies "rule changed" without embedding the rule.
@@ -89,14 +91,16 @@ async function dispatch(ev: WebhookEvent, rawBody: unknown): Promise<void> {
       );
       try {
         const remote = await propfirm.getTradingRules();
-        const results = await syncTradingRulesFromBody({ data: remote });
+        const wrapped = { data: remote };
+        const results = await syncTradingRulesFromBody(wrapped);
         const ok = results.filter((r) => r.applied).length;
+        noteTradingRulesFingerprintFromBody(wrapped);
         console.log(`[dxfeed webhook] trading rules pull-fallback synced ${ok}/${results.length}`);
       } catch (err) {
         console.warn(
           "[dxfeed webhook] trading rules pull-fallback failed:",
           (err as Error).message,
-          "— POST /api/dxfeed/trading-rules/pull with x-api-key to sync manually",
+          "— watch will retry on next poll if DXFEED_API_KEY is set",
         );
       }
     }
