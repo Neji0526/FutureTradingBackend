@@ -61,6 +61,9 @@ export async function handleDxFeedWebhook(apiKey: string | undefined, body: unkn
     const ev = (body ?? {}) as WebhookEvent;
     const keys = body && typeof body === "object" ? Object.keys(body as object).join(",") : typeof body;
     console.log(`[dxfeed webhook] recv category=${ev.category} event=${ev.event} keys=[${keys}]`);
+    if (body && typeof body === "object") {
+      console.log("[dxfeed webhook] body:", JSON.stringify(body));
+    }
     await dispatch(ev, body);
     return { status: 200, note: `category=${ev.category} event=${ev.event}` };
   } catch (err) {

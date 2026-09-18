@@ -216,11 +216,24 @@ export function normalizeTradingRule(raw: DxFeedTradingRulePayload): {
 
 /** Apply one Volumetrica trading-rule payload: create or update Vault template + cascade. */
 export async function applyDxFeedTradingRule(raw: DxFeedTradingRulePayload): Promise<SyncResult> {
+  console.log("[dxfeed rules] incoming rule from dxFeed:", JSON.stringify(raw));
+
   const normalized = normalizeTradingRule(raw);
   if (!normalized) {
     console.warn("[dxfeed rules] skip payload — missing Reference/reference/ruleId", summarizeRuleKeys(raw));
     return { reference: "?", templateId: null, applied: false, reason: "missing reference" };
   }
+
+  console.log(
+    "[dxfeed rules] normalized:",
+    JSON.stringify({
+      reference: normalized.reference,
+      label: normalized.label ?? null,
+      phase: normalized.phase,
+      accountSize: normalized.accountSize ?? null,
+      fields: normalized.fields,
+    }),
+  );
 
   if (!useDatabase) {
     console.warn(`[dxfeed rules] skip ${normalized.reference} — database not configured`);
@@ -352,14 +365,17 @@ export async function syncTradingRulesFromBody(body: unknown): Promise<SyncResul
   console.log(
     `[dxfeed rules] sync start — extracted ${rules.length} rule(s)` +
       (rules.length
-        ? ` refs=[${rules.map((r) => str(r.reference) ?? str(r.Reference) ?? str(r.ruleId) ?? "?").join(", ")}]`
+        ? ` refs=[${rules.map((r) => str(r.reference) ?? str(r.Reference) ?? str(r.ruleId) ?? str(r.RuleId) ?? "?").join(", ")}]`
         : ` bodyKeys=[${summarizeRuleKeys(body)}]`),
   );
+  if (rules.length > 0) {
+    console.log("[dxfeed rules] extracted payloads:", JSON.stringify(rules));
+  }
   const out: SyncResult[] = [];
   for (const r of rules) {
     out.push(await applyDxFeedTradingRule(r));
   }
   const applied = out.filter((r) => r.applied).length;
-  console.log(`[dxfeed rules] sync done — applied ${applied}/${out.length}`);
+  console.log(`[dxfeed rules] sync done — applied ${applied}/${out.length}`, JSON.stringify(out));
   return out;
 }
