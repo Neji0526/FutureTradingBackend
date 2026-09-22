@@ -211,6 +211,21 @@ export async function upsertDxFeedLink(link: DxFeedLinkInput): Promise<void> {
   );
 }
 
+export async function getDxFeedLinkByUserId(userId: string): Promise<DxFeedLink | null> {
+  if (!userId) return null;
+  if (!useDatabase) {
+    for (const link of memory.values()) {
+      if (link.userId === userId) return link;
+    }
+    return null;
+  }
+  const { rows } = await getPool().query(
+    `SELECT ${COLS} FROM "DxFeedAccount" WHERE "userId" = $1 ORDER BY "updatedAt" DESC LIMIT 1`,
+    [userId],
+  );
+  return rows[0] ? mapRow(rows[0]) : null;
+}
+
 export async function attachDxFeedUserId(orderNumber: string, userId: string): Promise<void> {
   if (!useDatabase) {
     const existing = memory.get(orderNumber);

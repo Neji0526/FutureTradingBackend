@@ -66,6 +66,7 @@ import {
   handleDxFeedTradingRulesPull,
   handlePublicTradingRules,
   handleOnboardingComplete,
+  handlePlatformAccess,
   handlePurchaseValidate,
 } from "../purchases/handlers.js";
 import { getMarketLiveState } from "../market-data/live-console.js";
@@ -265,6 +266,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
   if (url.pathname === "/api/account" && req.method === "GET") {
     return handleAccount(req, res);
+  }
+  if (url.pathname === "/api/platform-access" && req.method === "GET") {
+    return handlePlatformAccess(req, res, opts.auth, json);
   }
   if (url.pathname === "/api/account/request-reset" && req.method === "POST") {
     return handleRequestReset(req, res, opts.accountStream);
