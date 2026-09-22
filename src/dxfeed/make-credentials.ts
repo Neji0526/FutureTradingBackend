@@ -50,23 +50,24 @@ export async function notifyMakePlatformCredentials(input: {
     return { ok: false, reason };
   }
 
-  // Persist form first/last name before prepare so Make never greets from email local-part.
   const fn = input.firstName?.trim() || "";
   const ln = input.lastName?.trim() || "";
-  if (fn || ln) {
-    try {
-      const existing = await getDxFeedLinkByOrder(input.orderNumber);
-      if (existing) {
-        if (fn) existing.firstName = fn;
-        if (ln) existing.lastName = ln;
-        await upsertDxFeedLink(existing);
-      }
-    } catch (err) {
-      console.warn(
-        `[make] could not persist name for order ${input.orderNumber}:`,
-        (err as Error).message.slice(0, 160),
-      );
+
+  let namesWereMissing = false;
+  try {
+    const existing = await getDxFeedLinkByOrder(input.orderNumber);
+    namesWereMissing = !existing?.firstName?.trim() || !existing?.lastName?.trim();
+    // Persist signup-form names before prepare so Make never greets from email local-part.
+    if (existing && (fn || ln)) {
+      if (fn) existing.firstName = fn;
+      if (ln) existing.lastName = ln;
+      await upsertDxFeedLink(existing);
     }
+  } catch (err) {
+    console.warn(
+      `[make] could not persist name for order ${input.orderNumber}:`,
+      (err as Error).message.slice(0, 160),
+    );
   }
 
   // Always refresh/create subscription + credentials before send.
@@ -95,7 +96,10 @@ export async function notifyMakePlatformCredentials(input: {
     return { ok: false, reason };
   }
 
-  if (link.credentialsEmailedAt) {
+  // Allow a corrective resend when an earlier Make push had empty first/last name
+  // and the signup form has now supplied them.
+  const correctiveNameSend = namesWereMissing && Boolean(fn && ln);
+  if (link.credentialsEmailedAt && !correctiveNameSend) {
     const reason = `credentials already emailed for order ${input.orderNumber}`;
     console.log(`[make] ${reason}`);
     return { ok: false, reason };
@@ -109,7 +113,20 @@ export async function notifyMakePlatformCredentials(input: {
     return { ok: false, reason };
   }
 
-  const payload = buildCredentialsPayload(link, input);
+  const payload = buildCredentialsPayload(link, {
+    ...input,
+    firstName: fn || link.firstName || undefined,
+    lastName: ln || link.lastName || undefined,
+  });
+
+  if (!String(payload.first_name ?? "").trim() || !String(payload.last_name ?? "").trim()) {
+    const reason =
+      `refusing Make send with empty first/last name for order ${input.orderNumber}` +
+      ` (pass firstName/lastName from the signup form)`;
+    console.warn(`[make] ${reason}`);
+    return { ok: false, reason };
+  }
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json",
@@ -131,7 +148,10 @@ export async function notifyMakePlatformCredentials(input: {
     }
     await markCredentialsEmailed(input.orderNumber);
     console.log(
-      `[make] platform access emailed (${input.source ?? "dxfeed-agreement-signed"}) order ${input.orderNumber}`,
+      `[make] platform access emailed (${input.source ?? "dxfeed-agreement-signed"})` +
+        ` order ${input.orderNumber}` +
+        ` name=${payload.first_name} ${payload.last_name}` +
+        (correctiveNameSend ? " (corrective)" : ""),
     );
     return { ok: true };
   } catch (err) {
@@ -144,11 +164,14 @@ export async function notifyMakePlatformCredentials(input: {
 /**
  * When agreementSigned flips true: ensure platform creds + license/SSO, then notify Make.
  */
-export async function notifyMakeAfterAgreementSigned(orderNumber: string): Promise<MakeNotifyResult> {
+export async function notifyMakeAfterAgreementSigned(
+  orderNumber: string,
+  names?: { firstName?: string; lastName?: string },
+): Promise<MakeNotifyResult> {
   const link = await getDxFeedLinkByOrder(orderNumber);
   const email = link?.email ?? "";
-  const firstName = link?.firstName?.trim() || "";
-  const lastName = link?.lastName?.trim() || "";
+  const firstName = names?.firstName?.trim() || link?.firstName?.trim() || "";
+  const lastName = names?.lastName?.trim() || link?.lastName?.trim() || "";
   const name = [firstName, lastName].filter(Boolean).join(" ")
     || (email.includes("@")
       ? email.split("@")[0]!.replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
@@ -198,7 +221,9 @@ export function buildCredentialsPayload(
 
   const firstName = (input.firstName ?? link.firstName ?? "").trim();
   const lastName = (input.lastName ?? link.lastName ?? "").trim();
-  const name = [firstName, lastName].filter(Boolean).join(" ") || input.name;
+  const name = [firstName, lastName].filter(Boolean).join(" ") || input.name.trim();
+  const username = link.platformUsername || "";
+  const password = link.platformPassword || "";
 
   return {
     source: input.source ?? "dxfeed-agreement-signed",
@@ -220,10 +245,12 @@ export function buildCredentialsPayload(
     platform,
     Platform: platform,
     platformId,
-    platformUsername: link.platformUsername,
-    platformPassword: link.platformPassword,
-    username: link.platformUsername,
-    password: link.platformPassword,
+    platformUsername: username,
+    platformPassword: password,
+    platform_username: username,
+    platform_password: password,
+    username,
+    password,
     license,
     License: license,
     platformLicense: license,
