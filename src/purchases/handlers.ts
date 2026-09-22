@@ -303,9 +303,16 @@ export async function handleDxFeedAgreementStatus(
     return;
   }
 
-  const body = (await readJson<{ orderNumber?: string; email?: string }>(req)) ?? {};
+  const body = (await readJson<{
+    orderNumber?: string;
+    email?: string;
+    firstName?: string;
+    lastName?: string;
+  }>(req)) ?? {};
   const orderNumber = normalizeOrderNumber(body.orderNumber?.trim() ?? "");
   const email = body.email?.trim().toLowerCase() ?? "";
+  const firstName = body.firstName?.trim() ?? "";
+  const lastName = body.lastName?.trim() ?? "";
 
   if (!isValidOrderNumber(orderNumber)) return json(res, 400, { error: "Invalid order number." });
 
@@ -328,7 +335,18 @@ export async function handleDxFeedAgreementStatus(
         orderNumber,
         email: matchEmail,
         userId: donor.userId,
+        firstName: firstName || donor.firstName,
+        lastName: lastName || donor.lastName,
       });
+    }
+  } else if (firstName || lastName) {
+    // Keep signup-form names on the link so Make.com never greets from email.
+    if (firstName) link.firstName = firstName;
+    if (lastName) link.lastName = lastName;
+    try {
+      await upsertDxFeedLink(link);
+    } catch (e) {
+      console.warn("[onboarding] could not persist form name on status:", (e as Error).message);
     }
   }
 
@@ -347,7 +365,10 @@ export async function handleDxFeedAgreementStatus(
   // After dxFeed agreement is signed → Make.com emails Deepchart/ATAS/Quantower credentials.
   // Not shown in the browser; ClickFunnels Make scenario is separate.
   if (link.agreementSigned) {
-    void notifyMakeAfterAgreementSigned(orderNumber).catch((e) => {
+    void notifyMakeAfterAgreementSigned(orderNumber, {
+      firstName: firstName || link.firstName || undefined,
+      lastName: lastName || link.lastName || undefined,
+    }).catch((e) => {
       console.error("[onboarding] Make after agreement failed:", (e as Error).message);
     });
   }
