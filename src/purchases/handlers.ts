@@ -16,9 +16,14 @@ import {
 import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
 import {
   provisionForOnboarding,
+  preparePlatformCredentialsAfterAgreement,
   refreshAgreementStatus,
   resetForOnboarding,
 } from "../dxfeed/provision.js";
+import {
+  notifyMakeAfterAgreementSigned,
+  notifyMakePlatformCredentials,
+} from "../dxfeed/make-credentials.js";
 import { attachDxFeedUserId, getDxFeedLinkByOrder, getDxFeedLinksByEmail, upsertDxFeedLink } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
@@ -340,6 +345,14 @@ export async function handleDxFeedAgreementStatus(
     return;
   }
 
+  // After dxFeed agreement is signed → Make.com emails Deepchart/ATAS/Quantower credentials.
+  // Not shown in the browser; ClickFunnels Make scenario is separate.
+  if (link.agreementSigned) {
+    void notifyMakeAfterAgreementSigned(orderNumber).catch((e) => {
+      console.error("[onboarding] Make after agreement failed:", (e as Error).message);
+    });
+  }
+
   json(res, 200, {
     ok: true,
     required: true,
@@ -620,6 +633,22 @@ export async function handleOnboardingComplete(
     } catch (e) {
       console.error("[onboarding] account provisioning failed:", (e as Error).message);
     }
+  }
+
+  // After Vault signup: send Volumetrica platform access to the SECOND Make.com
+  // scenario (MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL) — not ClickFunnels purchase Make.
+  if (dxfeedProvisionReady) {
+    void (async () => {
+      await preparePlatformCredentialsAfterAgreement(orderNumber);
+      await notifyMakePlatformCredentials({
+        orderNumber,
+        email,
+        name,
+        source: "vault-signup-complete",
+      });
+    })().catch((e) => {
+      console.error("[onboarding] Make platform credentials after signup failed:", (e as Error).message);
+    });
   }
 
   json(res, 201, {

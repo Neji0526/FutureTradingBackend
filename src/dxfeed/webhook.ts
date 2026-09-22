@@ -104,6 +104,10 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
         await upsertDxFeedLink(link);
         if (sub.dxAgreementSigned) {
           console.log(`[dxfeed] user ${link.dxUserId} SIGNED the data agreement (order ${link.orderNumber})`);
+          const { notifyMakeAfterAgreementSigned } = await import("./make-credentials.js");
+          void notifyMakeAfterAgreementSigned(link.orderNumber).catch((e) => {
+            console.error("[dxfeed webhook] Make after agreement failed:", (e as Error).message);
+          });
         }
       }
       return;

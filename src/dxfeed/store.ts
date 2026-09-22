@@ -15,12 +15,20 @@ export interface DxFeedLink {
   agreementSigned: boolean;
   agreementLink: string | null;
   platform: number | null;
+  /** Deepchart / ATAS / Quantower login (from NewUser). */
+  platformUsername: string | null;
+  platformPassword: string | null;
+  /** Volumetrica Platforms license key (SubscriptionViewModel.volumetricaLicense). */
+  platformLicense: string | null;
+  downloadLink: string | null;
+  loginUrl: string | null;
+  credentialsEmailedAt: string | null;
 }
 
 export type DxFeedLinkInput = DxFeedLink;
 
 const COLS =
-  `"orderNumber","userId","email","dxUserId","dxAccountId","dxSubscriptionId","accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform"`;
+  `"orderNumber","userId","email","dxUserId","dxAccountId","dxSubscriptionId","accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform","platformUsername","platformPassword","platformLicense","downloadLink","loginUrl","credentialsEmailedAt"`;
 
 const memory = new Map<string, DxFeedLink>();
 
@@ -37,6 +45,33 @@ function mapRow(r: Record<string, unknown>): DxFeedLink {
     agreementSigned: r.agreementSigned === true,
     agreementLink: (r.agreementLink as string | null) ?? null,
     platform: r.platform == null ? null : Number(r.platform),
+    platformUsername: (r.platformUsername as string | null) ?? null,
+    platformPassword: (r.platformPassword as string | null) ?? null,
+    platformLicense: (r.platformLicense as string | null) ?? null,
+    downloadLink: (r.downloadLink as string | null) ?? null,
+    loginUrl: (r.loginUrl as string | null) ?? null,
+    credentialsEmailedAt: r.credentialsEmailedAt
+      ? new Date(r.credentialsEmailedAt as string).toISOString()
+      : null,
+  };
+}
+
+function emptyCreds(): Pick<
+  DxFeedLink,
+  | "platformUsername"
+  | "platformPassword"
+  | "platformLicense"
+  | "downloadLink"
+  | "loginUrl"
+  | "credentialsEmailedAt"
+> {
+  return {
+    platformUsername: null,
+    platformPassword: null,
+    platformLicense: null,
+    downloadLink: null,
+    loginUrl: null,
+    credentialsEmailedAt: null,
   };
 }
 
@@ -123,15 +158,20 @@ export async function getLinkByAccountId(dxAccountId: string): Promise<DxFeedLin
 }
 
 export async function upsertDxFeedLink(link: DxFeedLinkInput): Promise<void> {
+  const row: DxFeedLink = {
+    ...emptyCreds(),
+    ...link,
+  };
   if (!useDatabase) {
-    memory.set(link.orderNumber, { ...link });
+    memory.set(row.orderNumber, { ...row });
     return;
   }
   await getPool().query(
     `INSERT INTO "DxFeedAccount"
        ("orderNumber","userId","email","dxUserId","dxAccountId","dxSubscriptionId",
-        "accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform","updatedAt")
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
+        "accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform",
+        "platformUsername","platformPassword","platformLicense","downloadLink","loginUrl","credentialsEmailedAt","updatedAt")
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
      ON CONFLICT ("orderNumber") DO UPDATE SET
        "userId" = COALESCE(EXCLUDED."userId", "DxFeedAccount"."userId"),
        "email" = EXCLUDED."email",
@@ -143,11 +183,19 @@ export async function upsertDxFeedLink(link: DxFeedLinkInput): Promise<void> {
        "agreementSigned" = EXCLUDED."agreementSigned",
        "agreementLink" = EXCLUDED."agreementLink",
        "platform" = EXCLUDED."platform",
+       "platformUsername" = COALESCE(EXCLUDED."platformUsername", "DxFeedAccount"."platformUsername"),
+       "platformPassword" = COALESCE(EXCLUDED."platformPassword", "DxFeedAccount"."platformPassword"),
+       "platformLicense" = COALESCE(EXCLUDED."platformLicense", "DxFeedAccount"."platformLicense"),
+       "downloadLink" = COALESCE(EXCLUDED."downloadLink", "DxFeedAccount"."downloadLink"),
+       "loginUrl" = COALESCE(EXCLUDED."loginUrl", "DxFeedAccount"."loginUrl"),
+       "credentialsEmailedAt" = COALESCE(EXCLUDED."credentialsEmailedAt", "DxFeedAccount"."credentialsEmailedAt"),
        "updatedAt" = now()`,
     [
-      link.orderNumber, link.userId, link.email, link.dxUserId, link.dxAccountId,
-      link.dxSubscriptionId, link.accountStatus, link.subscriptionStatus,
-      link.agreementSigned, link.agreementLink, link.platform,
+      row.orderNumber, row.userId, row.email, row.dxUserId, row.dxAccountId,
+      row.dxSubscriptionId, row.accountStatus, row.subscriptionStatus,
+      row.agreementSigned, row.agreementLink, row.platform,
+      row.platformUsername, row.platformPassword, row.platformLicense,
+      row.downloadLink, row.loginUrl, row.credentialsEmailedAt,
     ],
   );
 }
@@ -161,5 +209,19 @@ export async function attachDxFeedUserId(orderNumber: string, userId: string): P
   await getPool().query(
     `UPDATE "DxFeedAccount" SET "userId" = $2, "updatedAt" = now() WHERE "orderNumber" = $1`,
     [orderNumber, userId],
+  );
+}
+
+export async function markCredentialsEmailed(orderNumber: string): Promise<void> {
+  const at = new Date().toISOString();
+  if (!useDatabase) {
+    const existing = memory.get(orderNumber);
+    if (existing) memory.set(orderNumber, { ...existing, credentialsEmailedAt: at });
+    return;
+  }
+  await getPool().query(
+    `UPDATE "DxFeedAccount" SET "credentialsEmailedAt" = now(), "updatedAt" = now()
+     WHERE "orderNumber" = $1`,
+    [orderNumber],
   );
 }

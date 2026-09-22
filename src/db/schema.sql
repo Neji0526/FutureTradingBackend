@@ -514,3 +514,11 @@ CREATE TABLE IF NOT EXISTS "DxFeedAccount" (
 CREATE INDEX IF NOT EXISTS "DxFeedAccount_dxUserId_idx" ON "DxFeedAccount" ("dxUserId");
 CREATE INDEX IF NOT EXISTS "DxFeedAccount_dxAccountId_idx" ON "DxFeedAccount" ("dxAccountId");
 CREATE INDEX IF NOT EXISTS "DxFeedAccount_email_idx" ON "DxFeedAccount" (lower("email"));
+
+-- Platform (Deepchart / ATAS / Quantower) credentials for Make.com email after agreement.
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "platformUsername" text;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "platformPassword" text;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "platformLicense" text;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "downloadLink" text;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "loginUrl" text;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "credentialsEmailedAt" timestamptz;
