@@ -81,6 +81,28 @@ export interface NewSubscriptionInput {
   forceUserOnboarding?: boolean;
   /** Where dxFeed redirects the browser after the trader signs the agreement. */
   redirectUrl?: string;
+  /**
+   * When platform = VOLUMETRICA (0): 1 = Deepchart®, 2 = Deepdom®.
+   * Required for volumetricaLicense / volumetricaDownloadLink on SubscriptionViewModel.
+   */
+  volumetricaPlatform?: number | null;
+  startDate?: string | null;
+  durationMonths?: number | null;
+  durationDays?: number | null;
+}
+
+/** SubscriptionViewModel fields we persist for Make.com email. */
+export interface SubscriptionView {
+  subscriptionId: string | null;
+  confirmationId: string | null;
+  status: number | null;
+  dxAgreementLink: string | null;
+  dxAgreementSigned: boolean;
+  platform: Platform | null;
+  volumetricaPlatform: string | null;
+  volumetricaLicense: string | null;
+  volumetricaDownloadLink: string | null;
+  userId: string | null;
 }
 
 export interface UserResult {

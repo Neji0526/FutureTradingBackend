@@ -3,6 +3,7 @@ import type {
   NewUserInput, UserResult,
   NewTradingAccountInput, NewTradingAccountResult,
   NewSubscriptionInput, SubscriptionResult,
+  SubscriptionView,
 } from "./types.js";
 
 /** Volumetrica Propfirm REST client — authenticated with DXFEED_API_KEY (x-api-key). */
@@ -29,7 +30,7 @@ export class PropfirmClient {
   private async request<T>(
     path: string,
     actionLabel: string,
-    opts: { method?: "GET" | "POST"; query?: Query; body?: unknown } = {},
+    opts: { method?: "GET" | "POST" | "PUT" | "DELETE"; query?: Query; body?: unknown } = {},
   ): Promise<T> {
     const method = opts.method ?? (opts.body ? "POST" : "GET");
     const url = new URL(path, this.baseUrl);
@@ -71,7 +72,7 @@ export class PropfirmClient {
    */
   private async callV2<T>(
     path: string,
-    opts: { method?: "GET" | "POST"; query?: Query; body?: unknown } = {},
+    opts: { method?: "GET" | "POST" | "PUT" | "DELETE"; query?: Query; body?: unknown } = {},
   ): Promise<T> {
     const label = `v2/${path}`;
     return this.request<T>(`/api/v2/Propsite/${path}`, label, opts);
@@ -111,6 +112,58 @@ export class PropfirmClient {
 
   newSubscription(input: NewSubscriptionInput): Promise<SubscriptionResult> {
     return this.call<SubscriptionResult>("NewSubscription", { method: "POST", body: input });
+  }
+
+  /**
+   * V2 GET /api/v2/Propsite/Subscription — SubscriptionViewModel
+   * (volumetricaLicense, volumetricaDownloadLink, volumetricaPlatform).
+   */
+  async getSubscriptionV2(
+    userId?: string | null,
+    subscriptionId?: string | null,
+  ): Promise<SubscriptionView | null> {
+    try {
+      const raw = await this.callV2<unknown>("Subscription", {
+        query: {
+          userId: userId || undefined,
+          subscriptionId: subscriptionId || undefined,
+        },
+      });
+      return normalizeSubscriptionView(raw);
+    } catch (err) {
+      if (err instanceof DxFeedApiError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  /** V2 POST /api/v2/Propsite/Subscription — create subscribed platform account. */
+  async createSubscriptionV2(input: NewSubscriptionInput): Promise<SubscriptionView> {
+    const raw = await this.callV2<unknown>("Subscription", { method: "POST", body: input });
+    const view = normalizeSubscriptionView(raw);
+    if (!view) throw new DxFeedApiError("v2/Subscription", 502, "empty SubscriptionViewModel");
+    return view;
+  }
+
+  /** V2 PUT /api/v2/Propsite/Subscription — update (e.g. set volumetricaPlatform). */
+  async updateSubscriptionV2(
+    subscriptionId: string,
+    input: NewSubscriptionInput,
+  ): Promise<SubscriptionView | null> {
+    const raw = await this.callV2<unknown>("Subscription", {
+      method: "PUT",
+      query: { subscriptionId },
+      body: input,
+    });
+    return normalizeSubscriptionView(raw);
+  }
+
+  /** V2 POST /api/v2/Propsite/Subscription/Active */
+  async activeSubscriptionV2(subscriptionId: string): Promise<SubscriptionView | null> {
+    const raw = await this.callV2<unknown>("Subscription/Active", {
+      method: "POST",
+      body: { subscriptionId },
+    });
+    return normalizeSubscriptionView(raw);
   }
 
   getUserAccounts(userId: string): Promise<Array<{ id?: string; header?: string; enabled?: boolean }>> {
@@ -243,6 +296,50 @@ function unwrapTradingRuleListRows(table: unknown): Record<string, unknown>[] {
     return nested.filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object");
   }
   return [];
+}
+
+function normalizeSubscriptionView(raw: unknown): SubscriptionView | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const nested = (o.data && typeof o.data === "object" && !Array.isArray(o.data)
+    ? o.data
+    : o) as Record<string, unknown>;
+
+  const subscriptionId = nested.subscriptionId;
+  if (typeof subscriptionId !== "string" || !subscriptionId) return null;
+
+  const signedRaw = nested.dxAgreementSigned;
+  const dxAgreementSigned =
+    signedRaw === true
+    || signedRaw === 1
+    || signedRaw === "1"
+    || signedRaw === "true";
+
+  const platform = nested.platform;
+  return {
+    subscriptionId,
+    confirmationId: typeof nested.confirmationId === "string" ? nested.confirmationId : null,
+    status: typeof nested.status === "number" ? nested.status : null,
+    dxAgreementLink: typeof nested.dxAgreementLink === "string" ? nested.dxAgreementLink : null,
+    dxAgreementSigned,
+    platform: typeof platform === "number" ? (platform as SubscriptionView["platform"]) : null,
+    volumetricaPlatform:
+      typeof nested.volumetricaPlatform === "string"
+        ? nested.volumetricaPlatform
+        : nested.volumetricaPlatform != null
+          ? String(nested.volumetricaPlatform)
+          : null,
+    volumetricaLicense:
+      typeof nested.volumetricaLicense === "string" && nested.volumetricaLicense.trim()
+        ? nested.volumetricaLicense.trim()
+        : null,
+    volumetricaDownloadLink:
+      typeof nested.volumetricaDownloadLink === "string"
+        && nested.volumetricaDownloadLink.startsWith("http")
+        ? nested.volumetricaDownloadLink
+        : null,
+    userId: typeof nested.userId === "string" ? nested.userId : null,
+  };
 }
 
 export const propfirm = new PropfirmClient();

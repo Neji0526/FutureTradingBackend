@@ -94,6 +94,11 @@ export const config = {
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isFinite(n)),
       platform: num("DXFEED_PLATFORM", 0),
+      /**
+       * When platform=0 (Volumetrica): 1=Deepchart®, 2=Deepdom®.
+       * Required for volumetricaDownloadLink / license on V2 Subscription.
+       */
+      volumetricaPlatform: num("DXFEED_VOLUMETRICA_PLATFORM", 1),
       country: process.env.DXFEED_DEFAULT_COUNTRY?.trim() || "US",
       /**
        * Public Vault origin for post-sign redirect back to onboarding
