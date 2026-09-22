@@ -522,3 +522,5 @@ ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "platformLicense" text;
 ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "downloadLink" text;
 ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "loginUrl" text;
 ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "credentialsEmailedAt" timestamptz;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "firstName" text;
+ALTER TABLE "DxFeedAccount" ADD COLUMN IF NOT EXISTS "lastName" text;

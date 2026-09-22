@@ -645,6 +645,8 @@ export async function handleOnboardingComplete(
         orderNumber,
         email,
         name,
+        firstName,
+        lastName,
         source: "vault-signup-complete",
         requireAgreementSigned: false,
       });
