@@ -181,6 +181,14 @@ if (config.jwt.secret === "dev-insecure-secret-change-me") {
   console.warn("[auth] JWT_SECRET not set — using an insecure dev secret. Set JWT_SECRET in production.");
 }
 
+if (config.make.platformCredentialsWebhookUrl) {
+  console.log("[make] platform credentials webhook configured");
+} else {
+  console.warn(
+    "[make] MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL not set — signup will not email Deepchart credentials",
+  );
+}
+
 /** Use the live Databento feed only when an API key is present. */
 export const useDatabento = config.databento.apiKey.length > 0;
 

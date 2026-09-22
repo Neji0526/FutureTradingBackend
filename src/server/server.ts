@@ -70,7 +70,7 @@ import {
 } from "../purchases/handlers.js";
 import { getMarketLiveState } from "../market-data/live-console.js";
 import { getPool } from "../db/pool.js";
-
+  
 interface ServerOptions {
   port: number;
   corsOrigin: string;
