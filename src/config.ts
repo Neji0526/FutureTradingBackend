@@ -106,7 +106,41 @@ export const config = {
           ? process.env.CORS_ORIGIN.trim()
           : "")
       ).replace(/\/$/, ""),
+      /**
+       * Optional static download URLs for Make email when Volumetrica does not
+       * return a link. Keys: "0" Deepchart, "1" Quantower, "2" ATAS, "default".
+       */
+      downloadUrls: {
+        "0": process.env.DXFEED_DOWNLOAD_URL_DEEPCHART?.trim() || "",
+        "1": process.env.DXFEED_DOWNLOAD_URL_QUANTOWER?.trim() || "",
+        "2": process.env.DXFEED_DOWNLOAD_URL_ATAS?.trim() || "",
+        default: process.env.DXFEED_DOWNLOAD_URL?.trim() || "",
+      } as Record<string, string>,
+      /**
+       * Fallback when LoginUrl SSO is unavailable. Prefer empty — Make should use
+       * the SSO loginUrl from Propsite LoginUrl when present.
+       */
+      loginUrls: {
+        "0": process.env.DXFEED_LOGIN_URL_DEEPCHART?.trim() || "",
+        "1": process.env.DXFEED_LOGIN_URL_QUANTOWER?.trim() || "",
+        "2": process.env.DXFEED_LOGIN_URL_ATAS?.trim() || "",
+        default: process.env.DXFEED_LOGIN_URL?.trim() || "",
+      } as Record<string, string>,
+      /** Shown in Deepchart desktop: "Use the following server for dxFeed connection". */
+      connectionServer: process.env.DXFEED_CONNECTION_SERVER?.trim() || "Propfirm",
     },
+  },
+
+  /**
+   * Make.com — platform credentials email after dxFeed agreement is signed.
+   * Separate from FutureTradingApp MAKE_WEBHOOK_URL (purchase → onboarding link).
+   */
+  make: {
+    platformCredentialsWebhookUrl:
+      process.env.MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL?.trim() || "",
+    /** Sent as header x-make-apikey when Make webhook auth is API key. */
+    platformCredentialsApiKey:
+      process.env.MAKE_PLATFORM_CREDENTIALS_API_KEY?.trim() || "",
   },
 
   jwt: {

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { config, dxfeedProvisionReady } from "../config.js";
 import { DxFeedApiError, propfirm } from "./propfirm.js";
 import {
@@ -12,6 +13,31 @@ import {
   AccountMode, Currency, EncryptionMode, IdReference, UserType,
   type DataFeedProduct, type Platform,
 } from "./types.js";
+
+/** Platform password (Deepchart / ATAS / Quantower) — shown once via Make email. */
+function makePlatformPassword(): string {
+  const raw = randomBytes(18).toString("base64").replace(/[+/=]/g, "");
+  return `Vt${raw.slice(0, 14)}!9`;
+}
+
+function emptyPlatformCreds(): Pick<
+  DxFeedLink,
+  | "platformUsername"
+  | "platformPassword"
+  | "platformLicense"
+  | "downloadLink"
+  | "loginUrl"
+  | "credentialsEmailedAt"
+> {
+  return {
+    platformUsername: null,
+    platformPassword: null,
+    platformLicense: null,
+    downloadLink: null,
+    loginUrl: null,
+    credentialsEmailedAt: null,
+  };
+}
 
 export interface OnboardingProvisionInput {
   orderNumber: string;
@@ -55,7 +81,8 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     if (!refreshed.agreementSigned) {
       await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
     }
-    return refreshed;
+    await ensurePlatformCredentials(refreshed, input);
+    return (await getDxFeedLinkByOrder(input.orderNumber)) ?? refreshed;
   }
 
   const recovered = await adoptExistingSubscriptionForOrder(input.orderNumber, email);
@@ -64,7 +91,8 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     if (!refreshed.agreementSigned) {
       await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
     }
-    return refreshed;
+    await ensurePlatformCredentials(refreshed, input);
+    return (await getDxFeedLinkByOrder(input.orderNumber)) ?? refreshed;
   }
 
   const p = config.dxfeed.provisioning;
@@ -85,22 +113,28 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     agreementSigned: false,
     agreementLink: null,
     platform: null,
+    ...emptyPlatformCreds(),
   };
   link.email = email;
 
   if (!link.dxUserId) {
-    const user = await propfirm.newUser({
+    await createOrRefreshPlatformUser(link, {
       firstName,
       lastName,
       email,
       country,
-      extEntityId: input.orderNumber,
-      encryptionMode: EncryptionMode.NONE,
-      userType: UserType.USER,
+      orderNumber: input.orderNumber,
+      forceNewPassword: false,
     });
-    if (!user.userId) throw new Error("provisionForOnboarding: NewUser returned no userId");
-    link.dxUserId = user.userId;
-    await upsertDxFeedLink(link);
+  } else if (!link.platformUsername || !link.platformPassword) {
+    await createOrRefreshPlatformUser(link, {
+      firstName,
+      lastName,
+      email,
+      country,
+      orderNumber: input.orderNumber,
+      forceNewPassword: true,
+    });
   }
 
   // Remote already has a sub (local id missing) — recover via GetSubscriptionStatus(userId).
@@ -168,6 +202,7 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
       link.agreementLink = sub.dxAgreementLink;
       link.agreementSigned = sub.dxAgreementSigned;
       link.platform = sub.platform;
+      await enrichDownloadAndLogin(link);
       await upsertDxFeedLink(link);
     } catch (err) {
       if (err instanceof DxFeedApiError && /already has a subscription/i.test(err.message)) {
@@ -193,6 +228,8 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     }
   }
 
+  await enrichDownloadAndLogin(link);
+  await upsertDxFeedLink(link);
   return link;
 }
 
@@ -295,6 +332,7 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
       deletedSubscription = false;
 
       await deleteDxFeedLinksByEmail(email);
+      const donorCreds = links.find((l) => l.platformUsername && l.platformPassword);
       const link: DxFeedLinkInput = {
         orderNumber: input.orderNumber,
         userId: null,
@@ -307,6 +345,12 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
         agreementSigned: false,
         agreementLink: remote.agreementLink ?? null,
         platform: remote.platform ?? null,
+        platformUsername: donorCreds?.platformUsername ?? null,
+        platformPassword: donorCreds?.platformPassword ?? null,
+        platformLicense: donorCreds?.platformLicense ?? remote.license ?? null,
+        downloadLink: donorCreds?.downloadLink ?? remote.downloadLink ?? null,
+        loginUrl: donorCreds?.loginUrl ?? null,
+        credentialsEmailedAt: null,
       };
       await upsertDxFeedLink(link);
       notes.push("stored refreshed agreement link for re-sign");
@@ -395,6 +439,15 @@ export async function refreshAgreementStatus(orderNumber: string): Promise<DxFee
       if (parsed.agreementLink !== undefined) {
         link.agreementLink = parsed.agreementLink ?? link.agreementLink;
       }
+      if (parsed.downloadLink && !link.downloadLink) {
+        link.downloadLink = parsed.downloadLink;
+      }
+      if (parsed.license && !link.platformLicense) {
+        link.platformLicense = parsed.license;
+      }
+      if (parsed.platform != null && link.platform == null) {
+        link.platform = parsed.platform;
+      }
       await upsertDxFeedLink(link);
       if (!before && link.agreementSigned) {
         console.log(
@@ -406,6 +459,29 @@ export async function refreshAgreementStatus(orderNumber: string): Promise<DxFee
     console.warn("[dxfeed] GetSubscriptionStatus failed:", (err as Error).message);
   }
   return link;
+}
+
+/**
+ * After dxFeed agreement is signed: ensure Deepchart/ATAS/Quantower username+password
+ * and download/login links exist on DxFeedAccount (for Make.com email).
+ */
+export async function preparePlatformCredentialsAfterAgreement(
+  orderNumber: string,
+): Promise<DxFeedLink | null> {
+  const link = (await refreshAgreementStatus(orderNumber)) ?? (await getDxFeedLinkByOrder(orderNumber));
+  if (!link?.agreementSigned || !link.dxUserId) return null;
+
+  const email = link.email.trim().toLowerCase();
+  const local = email.split("@")[0] || "Trader";
+  const parts = local.replace(/[._0-9]+/g, " ").trim().split(/\s+/).filter(Boolean);
+  await ensurePlatformCredentials(link, {
+    orderNumber,
+    email,
+    firstName: parts[0] || "Trader",
+    lastName: parts.slice(1).join(" ") || "Account",
+    country: config.dxfeed.provisioning.country,
+  });
+  return (await getDxFeedLinkByOrder(orderNumber)) ?? link;
 }
 
 async function ensureAgreementRedirect(
@@ -470,9 +546,113 @@ async function adoptExistingSubscriptionForOrder(
     agreementSigned,
     agreementLink,
     platform,
+    platformUsername: donor?.platformUsername ?? null,
+    platformPassword: donor?.platformPassword ?? null,
+    platformLicense: donor?.platformLicense ?? null,
+    downloadLink: donor?.downloadLink ?? null,
+    loginUrl: donor?.loginUrl ?? null,
+    credentialsEmailedAt: null,
   };
   await upsertDxFeedLink(link);
   return link;
+}
+
+/**
+ * Ensure Deepchart / ATAS / Quantower username+password exist on the link.
+ * Mints via NewUser(passwordToSet); rotates only when we have no stored password.
+ */
+async function ensurePlatformCredentials(
+  link: DxFeedLinkInput,
+  input: OnboardingProvisionInput,
+): Promise<void> {
+  const country = (input.country.trim().toUpperCase() || config.dxfeed.provisioning.country).slice(0, 2);
+  if (!link.platformUsername || !link.platformPassword) {
+    await createOrRefreshPlatformUser(link, {
+      firstName: input.firstName.trim() || "Trader",
+      lastName: input.lastName.trim() || "Account",
+      email: input.email.trim().toLowerCase(),
+      country,
+      orderNumber: input.orderNumber,
+      forceNewPassword: Boolean(link.dxUserId),
+    });
+  }
+  await enrichDownloadAndLogin(link);
+  await upsertDxFeedLink(link);
+}
+
+async function createOrRefreshPlatformUser(
+  link: DxFeedLinkInput,
+  opts: {
+    firstName: string;
+    lastName: string;
+    email: string;
+    country: string;
+    orderNumber: string;
+    forceNewPassword: boolean;
+  },
+): Promise<void> {
+  const password = makePlatformPassword();
+  const user = await propfirm.newUser({
+    firstName: opts.firstName,
+    lastName: opts.lastName,
+    email: opts.email,
+    country: opts.country,
+    extEntityId: opts.orderNumber,
+    encryptionMode: EncryptionMode.NONE,
+    userType: UserType.USER,
+    passwordToSet: password,
+    ...(opts.forceNewPassword ? { forceNewPassword: true } : {}),
+  });
+  if (!user.userId && !link.dxUserId) {
+    throw new Error("provisionForOnboarding: NewUser returned no userId");
+  }
+  if (user.userId) link.dxUserId = user.userId;
+  link.platformUsername = user.username?.trim() || opts.email;
+  link.platformPassword =
+    (user.encryptionMode === EncryptionMode.NONE ? user.password : null)?.trim() || password;
+  await upsertDxFeedLink(link);
+}
+
+/** Pull Volumetrica Platforms license + download + SSO LoginUrl for Make email. */
+async function enrichDownloadAndLogin(link: DxFeedLinkInput): Promise<void> {
+  if (link.dxSubscriptionId) {
+    try {
+      await propfirm.activeSubscription(link.dxSubscriptionId);
+    } catch {
+      /* already active or not yet ready */
+    }
+  }
+
+  if (link.dxUserId) {
+    const remote = await fetchRemoteSubscription(link.dxUserId);
+    if (remote?.downloadLink) link.downloadLink = remote.downloadLink;
+    if (remote?.license) link.platformLicense = remote.license;
+    if (remote?.platform != null) link.platform = remote.platform;
+    if (remote?.subscriptionId && !link.dxSubscriptionId) {
+      link.dxSubscriptionId = remote.subscriptionId;
+    }
+  }
+
+  if (!link.downloadLink) {
+    const key = String(link.platform ?? config.dxfeed.provisioning.platform);
+    const urls = config.dxfeed.provisioning.downloadUrls;
+    link.downloadLink = urls[key] || urls.default || null;
+  }
+
+  // Prefer fresh SSO into Volumetrica Platforms (license + Deepchart download page).
+  if (link.dxUserId) {
+    try {
+      const sso = await propfirm.getLoginUrl(link.dxUserId, link.dxAccountId);
+      if (sso) link.loginUrl = sso;
+    } catch {
+      /* optional */
+    }
+  }
+  if (!link.loginUrl) {
+    const key = String(link.platform ?? config.dxfeed.provisioning.platform);
+    const urls = config.dxfeed.provisioning.loginUrls;
+    link.loginUrl = urls[key] || urls.default || null;
+  }
 }
 
 async function fetchRemoteSubscription(dxUserId: string): Promise<{
@@ -481,6 +661,8 @@ async function fetchRemoteSubscription(dxUserId: string): Promise<{
   agreementSigned?: boolean;
   agreementLink?: string | null;
   platform?: number | null;
+  downloadLink?: string | null;
+  license?: string | null;
 } | null> {
   try {
     const raw = await propfirm.getSubscriptionStatus(dxUserId, null);
@@ -499,6 +681,8 @@ function applyRemoteSubscription(
     agreementSigned?: boolean;
     agreementLink?: string | null;
     platform?: number | null;
+    downloadLink?: string | null;
+    license?: string | null;
   },
 ): void {
   if (remote.subscriptionId) link.dxSubscriptionId = remote.subscriptionId;
@@ -506,6 +690,8 @@ function applyRemoteSubscription(
   if (typeof remote.agreementSigned === "boolean") link.agreementSigned = remote.agreementSigned;
   if (remote.agreementLink !== undefined) link.agreementLink = remote.agreementLink ?? link.agreementLink;
   if (remote.platform != null) link.platform = remote.platform;
+  if (remote.downloadLink) link.downloadLink = remote.downloadLink;
+  if (remote.license) link.platformLicense = remote.license;
 }
 
 function uniqueLinks(links: DxFeedLink[]): DxFeedLink[] {
@@ -525,6 +711,8 @@ function parseSubscriptionStatus(raw: unknown): {
   agreementSigned?: boolean;
   agreementLink?: string | null;
   platform?: number | null;
+  downloadLink?: string | null;
+  license?: string | null;
 } | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
@@ -551,6 +739,19 @@ function parseSubscriptionStatus(raw: unknown): {
     | null
     | undefined;
   const platform = nested.platform ?? o.platform;
+  const downloadRaw =
+    nested.volumetricaDownloadLink
+    ?? nested.downloadLink
+    ?? nested.platformDownloadUrl
+    ?? nested.downloadUrl
+    ?? o.volumetricaDownloadLink
+    ?? o.downloadLink;
+  const downloadLink =
+    typeof downloadRaw === "string" && downloadRaw.startsWith("http") ? downloadRaw : null;
+  const licenseRaw =
+    nested.volumetricaLicense ?? nested.license ?? o.volumetricaLicense ?? o.license;
+  const license =
+    typeof licenseRaw === "string" && licenseRaw.trim() ? licenseRaw.trim() : null;
 
   return {
     subscriptionId: typeof subscriptionId === "string" && subscriptionId ? subscriptionId : undefined,
@@ -558,5 +759,7 @@ function parseSubscriptionStatus(raw: unknown): {
     agreementSigned,
     agreementLink,
     platform: typeof platform === "number" ? platform : null,
+    downloadLink,
+    license,
   };
 }

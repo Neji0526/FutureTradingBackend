@@ -81,6 +81,30 @@ export class PropfirmClient {
     return this.call<UserResult>("NewUser", { method: "POST", body: input });
   }
 
+  /**
+   * SSO / magic login into Volumetrica dashboard (Platforms → Deepchart license + download).
+   * POST /api/Propsite/LoginUrl — returns a short-lived URL string.
+   */
+  async getLoginUrl(userId: string, accountId?: string | null): Promise<string | null> {
+    try {
+      const data = await this.call<string | { url?: string; loginUrl?: string }>("LoginUrl", {
+        method: "POST",
+        body: {
+          userId,
+          ...(accountId ? { accountId } : {}),
+        },
+      });
+      if (typeof data === "string" && data.startsWith("http")) return data;
+      if (data && typeof data === "object") {
+        const url = data.url ?? data.loginUrl;
+        if (typeof url === "string" && url.startsWith("http")) return url;
+      }
+    } catch {
+      /* optional on some hosts */
+    }
+    return null;
+  }
+
   createTradingAccount(input: NewTradingAccountInput): Promise<NewTradingAccountResult> {
     return this.call<NewTradingAccountResult>("CreateTradingAccount", { method: "POST", body: input });
   }

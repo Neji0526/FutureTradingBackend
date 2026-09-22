@@ -53,6 +53,10 @@ export interface NewUserInput {
   username?: string;
   extEntityId?: string;
   encryptionMode?: EncryptionMode;
+  /** When true, Volumetrica rotates the platform password to passwordToSet. */
+  forceNewPassword?: boolean;
+  /** Plain password we want the platform to use (Deepchart / ATAS / Quantower). */
+  passwordToSet?: string;
   userType?: UserType;
   systemAccess?: SystemAccess;
 }
