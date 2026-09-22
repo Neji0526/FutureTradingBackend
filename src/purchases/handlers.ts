@@ -16,7 +16,6 @@ import {
 import { isValidOrderNumber, normalizeOrderNumber } from "./order-number.js";
 import {
   provisionForOnboarding,
-  preparePlatformCredentialsAfterAgreement,
   refreshAgreementStatus,
   resetForOnboarding,
 } from "../dxfeed/provision.js";
@@ -635,26 +634,41 @@ export async function handleOnboardingComplete(
     }
   }
 
-  // After Vault signup: send Volumetrica platform access to the SECOND Make.com
-  // scenario (MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL) — not ClickFunnels purchase Make.
+  // After Vault signup: AWAIT send to second Make.com webhook (not fire-and-forget).
+  // Previously void() returned 201 before Make ran — prepare/notify often never finished
+  // or skipped silently (missing password / stale flags).
+  let makeOk = false;
+  let makeReason: string | undefined;
   if (dxfeedProvisionReady) {
-    void (async () => {
-      await preparePlatformCredentialsAfterAgreement(orderNumber);
-      await notifyMakePlatformCredentials({
+    try {
+      const result = await notifyMakePlatformCredentials({
         orderNumber,
         email,
         name,
         source: "vault-signup-complete",
+        requireAgreementSigned: false,
       });
-    })().catch((e) => {
-      console.error("[onboarding] Make platform credentials after signup failed:", (e as Error).message);
-    });
+      makeOk = result.ok;
+      makeReason = result.reason;
+      if (!result.ok) {
+        console.error(
+          `[onboarding] Make platform credentials not sent for ${orderNumber}: ${result.reason ?? "unknown"}`,
+        );
+      }
+    } catch (e) {
+      makeReason = (e as Error).message;
+      console.error("[onboarding] Make platform credentials after signup failed:", makeReason);
+    }
+  } else {
+    makeReason = "dxfeed provision not configured";
   }
 
   json(res, 201, {
     ok: true,
     orderNumber: redeemed.orderNumber,
     email: redeemed.email,
+    makeOk,
+    ...(makeReason && !makeOk ? { makeReason } : {}),
   });
 }
 

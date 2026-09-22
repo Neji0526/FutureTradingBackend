@@ -19,10 +19,14 @@ export function platformLabel(platform: number | null | undefined): string {
   }
 }
 
+export type MakeNotifyResult = {
+  ok: boolean;
+  reason?: string;
+};
+
 /**
- * After dxFeed agreement is signed: POST Volumetrica platform access to Make.com.
- * Includes username/password, license, download link, SSO loginUrl, connection server.
- * Idempotent via credentialsEmailedAt. Non-fatal if Make is down.
+ * POST Volumetrica platform access to the SECOND Make.com webhook
+ * (MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL). Returns whether Make accepted.
  */
 export async function notifyMakePlatformCredentials(input: {
   orderNumber: string;
@@ -30,33 +34,57 @@ export async function notifyMakePlatformCredentials(input: {
   name: string;
   /** Override payload source (default: dxfeed-agreement-signed). */
   source?: string;
-}): Promise<void> {
+  /**
+   * When true (Vault signup complete), skip the agreementSigned DB gate —
+   * onboarding already required a signed agreement before register.
+   */
+  requireAgreementSigned?: boolean;
+}): Promise<MakeNotifyResult> {
   const url = config.make.platformCredentialsWebhookUrl;
   if (!url) {
+    const reason = "MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL unset";
+    console.warn(`[make] ${reason} — skipping platform credentials email`);
+    return { ok: false, reason };
+  }
+
+  // Always refresh/create subscription + credentials before send.
+  try {
+    const { preparePlatformCredentialsAfterAgreement } = await import("./provision.js");
+    await preparePlatformCredentialsAfterAgreement(input.orderNumber);
+  } catch (err) {
     console.warn(
-      "[make] MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL unset — skipping platform credentials email",
+      `[make] prepare before notify failed order ${input.orderNumber}:`,
+      (err as Error).message.slice(0, 240),
     );
-    return;
   }
 
   const link = await getDxFeedLinkByOrder(input.orderNumber);
   if (!link) {
-    console.warn(`[make] no DxFeedAccount for order ${input.orderNumber} — skip credentials email`);
-    return;
+    const reason = `no DxFeedAccount for order ${input.orderNumber}`;
+    console.warn(`[make] ${reason}`);
+    return { ok: false, reason };
   }
-  if (!link.agreementSigned) {
-    console.log(`[make] agreement not signed yet for order ${input.orderNumber} — skip`);
-    return;
+
+  const requireAgreement = input.requireAgreementSigned !== false
+    && input.source !== "vault-signup-complete";
+  if (requireAgreement && !link.agreementSigned) {
+    const reason = `agreement not signed yet for order ${input.orderNumber}`;
+    console.log(`[make] ${reason}`);
+    return { ok: false, reason };
   }
+
   if (link.credentialsEmailedAt) {
-    console.log(`[make] credentials already emailed for order ${input.orderNumber}`);
-    return;
+    const reason = `credentials already emailed for order ${input.orderNumber}`;
+    console.log(`[make] ${reason}`);
+    return { ok: false, reason };
   }
+
   if (!link.platformUsername || !link.platformPassword) {
-    console.warn(
-      `[make] missing platform username/password for order ${input.orderNumber} — skip credentials email`,
-    );
-    return;
+    const reason =
+      `missing platform username/password for order ${input.orderNumber}` +
+      ` (user=${link.platformUsername ? "yes" : "no"} pass=${link.platformPassword ? "yes" : "no"})`;
+    console.warn(`[make] ${reason}`);
+    return { ok: false, reason };
   }
 
   const payload = buildCredentialsPayload(link, input);
@@ -75,36 +103,38 @@ export async function notifyMakePlatformCredentials(input: {
     });
     if (!res.ok) {
       const t = await res.text().catch(() => "");
-      console.error(
-        `[make] platform credentials webhook rejected HTTP ${res.status}: ${t.slice(0, 400)}`,
-      );
-      return;
+      const reason = `Make webhook HTTP ${res.status}: ${t.slice(0, 200)}`;
+      console.error(`[make] ${reason}`);
+      return { ok: false, reason };
     }
     await markCredentialsEmailed(input.orderNumber);
     console.log(
       `[make] platform access emailed (${input.source ?? "dxfeed-agreement-signed"}) order ${input.orderNumber}`,
     );
+    return { ok: true };
   } catch (err) {
-    console.error("[make] platform credentials webhook unreachable:", (err as Error).message);
+    const reason = `Make webhook unreachable: ${(err as Error).message}`;
+    console.error(`[make] ${reason}`);
+    return { ok: false, reason };
   }
 }
 
 /**
  * When agreementSigned flips true: ensure platform creds + license/SSO, then notify Make.
  */
-export async function notifyMakeAfterAgreementSigned(orderNumber: string): Promise<void> {
-  const { preparePlatformCredentialsAfterAgreement } = await import("./provision.js");
-  const prepared = await preparePlatformCredentialsAfterAgreement(orderNumber);
-  if (!prepared) return;
+export async function notifyMakeAfterAgreementSigned(orderNumber: string): Promise<MakeNotifyResult> {
+  const link = await getDxFeedLinkByOrder(orderNumber);
+  const email = link?.email ?? "";
+  const name = email.includes("@")
+    ? email.split("@")[0]!.replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+    : "Trader";
 
-  const email = prepared.email;
-  const name =
-    email.includes("@") ? email.split("@")[0]!.replace(/[._]/g, " ") : "Trader";
-
-  await notifyMakePlatformCredentials({
-    orderNumber: prepared.orderNumber,
-    email,
-    name: name.replace(/\b\w/g, (c) => c.toUpperCase()),
+  return notifyMakePlatformCredentials({
+    orderNumber,
+    email: email || "unknown@example.com",
+    name,
+    source: "dxfeed-agreement-signed",
+    requireAgreementSigned: true,
   });
 }
 
@@ -146,24 +176,19 @@ export function buildCredentialsPayload(
     platform,
     Platform: platform,
     platformId,
-    // Volumetrica Platforms account (Deepchart / ATAS / Quantower)
     platformUsername: link.platformUsername,
     platformPassword: link.platformPassword,
     username: link.platformUsername,
     password: link.platformPassword,
-    // License shown on Volumetrica → Download platform (Deepchart®)
     license,
     License: license,
     platformLicense: license,
     volumetricaLicense: license,
-    // Setup installer link when API returns it
     downloadLink,
     download_link: downloadLink,
-    // SSO into Volumetrica dashboard (Platforms / license / download) — preferred CTA
     loginUrl,
     login_url: loginUrl,
     platformsUrl: loginUrl,
-    // Desktop connection param from Volumetrica UI
     connectionServer,
     dxFeedConnectionServer: connectionServer,
     server: connectionServer,

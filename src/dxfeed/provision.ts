@@ -190,18 +190,7 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
 
   if (!link.dxSubscriptionId) {
     try {
-      const sub = await propfirm.newSubscription({
-        userId: link.dxUserId,
-        dataFeedProducts: p.dataFeedProducts as DataFeedProduct[],
-        platform: p.platform as Platform,
-        enabled: true,
-        ...(redirectUrl ? { redirectUrl } : {}),
-      });
-      link.dxSubscriptionId = sub.subscriptionId;
-      link.subscriptionStatus = sub.status;
-      link.agreementLink = sub.dxAgreementLink;
-      link.agreementSigned = sub.dxAgreementSigned;
-      link.platform = sub.platform;
+      await ensureV2SubscribedAccount(link, redirectUrl);
       await enrichDownloadAndLogin(link);
       await upsertDxFeedLink(link);
     } catch (err) {
@@ -209,6 +198,11 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
         const remote = await fetchRemoteSubscription(link.dxUserId);
         if (remote?.subscriptionId) {
           applyRemoteSubscription(link, remote);
+          try {
+            await ensureV2SubscribedAccount(link, redirectUrl);
+          } catch (e2) {
+            console.warn("[dxfeed] ensureV2 after adopt:", (e2 as Error).message.slice(0, 200));
+          }
           await upsertDxFeedLink(link);
           if (!link.agreementSigned) {
             await ensureAgreementRedirect(link, input.orderNumber, redirectUrl);
@@ -218,13 +212,28 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
         const again = await adoptExistingSubscriptionForOrder(input.orderNumber, email, link.dxUserId);
         if (again?.dxSubscriptionId) {
           const refreshed = (await refreshAgreementStatus(input.orderNumber)) ?? again;
+          try {
+            await ensureV2SubscribedAccount(refreshed, redirectUrl);
+            await upsertDxFeedLink(refreshed);
+          } catch (e2) {
+            console.warn("[dxfeed] ensureV2 after recover:", (e2 as Error).message.slice(0, 200));
+          }
           if (!refreshed.agreementSigned) {
             await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
           }
-          return refreshed;
+          return (await getDxFeedLinkByOrder(input.orderNumber)) ?? refreshed;
         }
       }
       throw err;
+    }
+  } else {
+    // Existing local subscription id — still ensure V2 Deepchart fields (license/download).
+    try {
+      await ensureV2SubscribedAccount(link, redirectUrl);
+      await enrichDownloadAndLogin(link);
+      await upsertDxFeedLink(link);
+    } catch (e) {
+      console.warn("[dxfeed] ensureV2 existing sub:", (e as Error).message.slice(0, 200));
     }
   }
 
@@ -462,18 +471,28 @@ export async function refreshAgreementStatus(orderNumber: string): Promise<DxFee
 }
 
 /**
- * After dxFeed agreement is signed: ensure Deepchart/ATAS/Quantower username+password
- * and download/login links exist on DxFeedAccount (for Make.com email).
+ * After dxFeed agreement is signed / onboarding complete:
+ * ensure V2 subscribed account (Deepchart license + download), credentials, SSO.
  */
 export async function preparePlatformCredentialsAfterAgreement(
   orderNumber: string,
 ): Promise<DxFeedLink | null> {
   const link = (await refreshAgreementStatus(orderNumber)) ?? (await getDxFeedLinkByOrder(orderNumber));
-  if (!link?.agreementSigned || !link.dxUserId) return null;
+  if (!link?.dxUserId) return null;
 
   const email = link.email.trim().toLowerCase();
   const local = email.split("@")[0] || "Trader";
   const parts = local.replace(/[._0-9]+/g, " ").trim().split(/\s+/).filter(Boolean);
+
+  try {
+    await ensureV2SubscribedAccount(link, agreementRedirectUrl(orderNumber));
+  } catch (err) {
+    console.warn(
+      `[dxfeed] ensureV2SubscribedAccount order ${orderNumber}:`,
+      (err as Error).message.slice(0, 240),
+    );
+  }
+
   await ensurePlatformCredentials(link, {
     orderNumber,
     email,
@@ -481,7 +500,134 @@ export async function preparePlatformCredentialsAfterAgreement(
     lastName: parts.slice(1).join(" ") || "Account",
     country: config.dxfeed.provisioning.country,
   });
+
+  await enrichDownloadAndLogin(link);
+  await upsertDxFeedLink(link);
   return (await getDxFeedLinkByOrder(orderNumber)) ?? link;
+}
+
+function subscriptionPayload(userId: string, redirectUrl?: string) {
+  const p = config.dxfeed.provisioning;
+  return {
+    userId,
+    dataFeedProducts: p.dataFeedProducts as DataFeedProduct[],
+    platform: p.platform as Platform,
+    enabled: true,
+    ...(p.platform === 0 && p.volumetricaPlatform
+      ? { volumetricaPlatform: p.volumetricaPlatform }
+      : {}),
+    ...(redirectUrl ? { redirectUrl } : {}),
+  };
+}
+
+function applySubscriptionView(
+  link: DxFeedLinkInput,
+  view: {
+    subscriptionId: string | null;
+    status: number | null;
+    dxAgreementSigned: boolean;
+    dxAgreementLink: string | null;
+    platform: number | null;
+    volumetricaLicense: string | null;
+    volumetricaDownloadLink: string | null;
+  },
+): void {
+  if (view.subscriptionId) link.dxSubscriptionId = view.subscriptionId;
+  if (view.status != null) link.subscriptionStatus = view.status;
+  link.agreementSigned = view.dxAgreementSigned || link.agreementSigned;
+  if (view.dxAgreementLink) link.agreementLink = view.dxAgreementLink;
+  if (view.platform != null) link.platform = view.platform;
+  if (view.volumetricaDownloadLink) link.downloadLink = view.volumetricaDownloadLink;
+  if (view.volumetricaLicense) link.platformLicense = view.volumetricaLicense;
+}
+
+/**
+ * Create or activate V2 Propsite Subscription so Volumetrica returns
+ * volumetricaDownloadLink / license (Deepchart Platforms page).
+ */
+async function ensureV2SubscribedAccount(
+  link: DxFeedLinkInput,
+  redirectUrl?: string,
+): Promise<void> {
+  if (!link.dxUserId) return;
+  const payload = subscriptionPayload(link.dxUserId, redirectUrl);
+
+  let view =
+    (await propfirm.getSubscriptionV2(link.dxUserId, link.dxSubscriptionId))
+    ?? (link.dxSubscriptionId
+      ? await propfirm.getSubscriptionV2(null, link.dxSubscriptionId)
+      : null)
+    ?? (await propfirm.getSubscriptionV2(link.dxUserId, null));
+
+  if (!view) {
+    try {
+      view = await propfirm.createSubscriptionV2(payload);
+      console.log(
+        `[dxfeed] V2 Subscription created ${view.subscriptionId} platform=${view.volumetricaPlatform ?? payload.platform}`,
+      );
+    } catch (err) {
+      if (!(err instanceof DxFeedApiError) || !/already has a subscription|already exist/i.test(err.message)) {
+        // Fall back to V1 create once, then re-read.
+        try {
+          const sub = await propfirm.newSubscription(payload);
+          link.dxSubscriptionId = sub.subscriptionId;
+          link.subscriptionStatus = sub.status;
+          link.agreementLink = sub.dxAgreementLink;
+          link.agreementSigned = sub.dxAgreementSigned;
+          link.platform = sub.platform;
+          view = await propfirm.getSubscriptionV2(link.dxUserId, sub.subscriptionId)
+            ?? await propfirm.getSubscriptionV2(link.dxUserId, null);
+        } catch (e2) {
+          if (err instanceof DxFeedApiError) throw err;
+          throw e2;
+        }
+      } else {
+        const remote = await fetchRemoteSubscription(link.dxUserId);
+        if (remote?.subscriptionId) {
+          applyRemoteSubscription(link, remote);
+          view = await propfirm.getSubscriptionV2(link.dxUserId, remote.subscriptionId)
+            ?? await propfirm.getSubscriptionV2(link.dxUserId, null);
+        }
+        if (!view) throw err;
+      }
+    }
+  }
+
+  if (!view?.subscriptionId) return;
+  const subscriptionId = view.subscriptionId;
+
+  // Ensure Deepchart® product is attached (download link).
+  if (!view.volumetricaDownloadLink && payload.volumetricaPlatform) {
+    try {
+      const updated = await propfirm.updateSubscriptionV2(subscriptionId, payload);
+      if (updated) view = updated;
+    } catch {
+      try {
+        await propfirm.updateSubscription(subscriptionId, payload);
+        view = await propfirm.getSubscriptionV2(link.dxUserId, subscriptionId) ?? view;
+      } catch (e) {
+        console.warn("[dxfeed] subscription update volumetricaPlatform:", (e as Error).message.slice(0, 160));
+      }
+    }
+  }
+
+  try {
+    const activated = await propfirm.activeSubscriptionV2(subscriptionId);
+    if (activated) view = activated;
+  } catch {
+    try {
+      await propfirm.activeSubscription(subscriptionId);
+    } catch {
+      /* already active */
+    }
+  }
+
+  view = await propfirm.getSubscriptionV2(link.dxUserId, subscriptionId)
+    ?? await propfirm.getSubscriptionV2(null, subscriptionId)
+    ?? view;
+
+  applySubscriptionView(link, view);
+  await upsertDxFeedLink(link);
 }
 
 async function ensureAgreementRedirect(
@@ -498,6 +644,9 @@ async function ensureAgreementRedirect(
       dataFeedProducts: p.dataFeedProducts as DataFeedProduct[],
       platform: p.platform as Platform,
       enabled: true,
+      ...(p.platform === 0 && p.volumetricaPlatform
+        ? { volumetricaPlatform: p.volumetricaPlatform }
+        : {}),
       redirectUrl: url,
     });
   } catch (err) {
@@ -615,31 +764,32 @@ async function createOrRefreshPlatformUser(
 
 /** Pull Volumetrica Platforms license + download + SSO LoginUrl for Make email. */
 async function enrichDownloadAndLogin(link: DxFeedLinkInput): Promise<void> {
-  if (link.dxSubscriptionId) {
-    try {
-      await propfirm.activeSubscription(link.dxSubscriptionId);
-    } catch {
-      /* already active or not yet ready */
-    }
-  }
-
   if (link.dxUserId) {
-    const remote = await fetchRemoteSubscription(link.dxUserId);
-    if (remote?.downloadLink) link.downloadLink = remote.downloadLink;
-    if (remote?.license) link.platformLicense = remote.license;
-    if (remote?.platform != null) link.platform = remote.platform;
-    if (remote?.subscriptionId && !link.dxSubscriptionId) {
-      link.dxSubscriptionId = remote.subscriptionId;
+    try {
+      const view = await propfirm.getSubscriptionV2(link.dxUserId, link.dxSubscriptionId)
+        ?? (link.dxSubscriptionId
+          ? await propfirm.getSubscriptionV2(null, link.dxSubscriptionId)
+          : null)
+        ?? (await propfirm.getSubscriptionV2(link.dxUserId, null));
+      if (view) applySubscriptionView(link, view);
+    } catch {
+      /* fall through to V1 parse */
     }
+    const remote = await fetchRemoteSubscription(link.dxUserId);
+    if (remote) applyRemoteSubscription(link, remote);
   }
 
+  if (!link.downloadLink && link.dxSubscriptionId) {
+    // Stable Volumetrica installer URL pattern observed from V2 create response.
+    link.downloadLink =
+      `${config.dxfeed.propfirmUrl.replace(/\/$/, "")}/download/PlatformSetup/${link.dxSubscriptionId}`;
+  }
   if (!link.downloadLink) {
     const key = String(link.platform ?? config.dxfeed.provisioning.platform);
     const urls = config.dxfeed.provisioning.downloadUrls;
     link.downloadLink = urls[key] || urls.default || null;
   }
 
-  // Prefer fresh SSO into Volumetrica Platforms (license + Deepchart download page).
   if (link.dxUserId) {
     try {
       const sso = await propfirm.getLoginUrl(link.dxUserId, link.dxAccountId);

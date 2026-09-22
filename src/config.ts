@@ -94,6 +94,11 @@ export const config = {
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isFinite(n)),
       platform: num("DXFEED_PLATFORM", 0),
+      /**
+       * When platform=0 (Volumetrica): 1=Deepchart®, 2=Deepdom®.
+       * Required for volumetricaDownloadLink / license on V2 Subscription.
+       */
+      volumetricaPlatform: num("DXFEED_VOLUMETRICA_PLATFORM", 1),
       country: process.env.DXFEED_DEFAULT_COUNTRY?.trim() || "US",
       /**
        * Public Vault origin for post-sign redirect back to onboarding
@@ -174,6 +179,14 @@ export const config = {
 
 if (config.jwt.secret === "dev-insecure-secret-change-me") {
   console.warn("[auth] JWT_SECRET not set — using an insecure dev secret. Set JWT_SECRET in production.");
+}
+
+if (config.make.platformCredentialsWebhookUrl) {
+  console.log("[make] platform credentials webhook configured");
+} else {
+  console.warn(
+    "[make] MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL not set — signup will not email Deepchart credentials",
+  );
 }
 
 /** Use the live Databento feed only when an API key is present. */
