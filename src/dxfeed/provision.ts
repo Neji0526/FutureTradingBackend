@@ -4,6 +4,7 @@ import { DxFeedApiError, propfirm } from "./propfirm.js";
 import {
   deleteDxFeedLinksByEmail,
   getDxFeedLinkByOrder,
+  getDxFeedLinkByUserId,
   getDxFeedLinksByEmail,
   upsertDxFeedLink,
   type DxFeedLink,
@@ -13,6 +14,18 @@ import {
   AccountMode, Currency, EncryptionMode, IdReference, UserType,
   type DataFeedProduct, type Platform,
 } from "./types.js";
+
+function labelPlatform(platform: number | null | undefined): string {
+  switch (platform) {
+    case 1:
+      return "Quantower";
+    case 2:
+      return "ATAS";
+    case 0:
+    default:
+      return "Deepchart";
+  }
+}
 
 /** Platform password (Deepchart / ATAS / Quantower) — shown once via Make email. */
 function makePlatformPassword(): string {
@@ -520,6 +533,68 @@ export async function preparePlatformCredentialsAfterAgreement(
   await enrichDownloadAndLogin(link);
   await upsertDxFeedLink(link);
   return (await getDxFeedLinkByOrder(orderNumber)) ?? link;
+}
+
+export type PlatformAccessView = {
+  ready: boolean;
+  platform: string;
+  platformId: number | null;
+  downloadLink: string | null;
+  /** Fresh short-lived Volumetrica SSO URL when available. */
+  loginUrl: string | null;
+  username: string | null;
+  connectionServer: string;
+};
+
+/**
+ * Dashboard: resolve Deepchart download + one-time login for the signed-in trader.
+ * Mints a fresh LoginUrl SSO each call (links expire).
+ */
+export async function resolvePlatformAccessForTrader(opts: {
+  userId: string;
+  email: string;
+}): Promise<PlatformAccessView | null> {
+  if (!dxfeedProvisionReady) return null;
+
+  const email = opts.email.trim().toLowerCase();
+  let link =
+    (await getDxFeedLinkByUserId(opts.userId))
+    ?? (email
+      ? (await getDxFeedLinksByEmail(email)).find((l) => l.dxUserId) ?? null
+      : null);
+
+  if (!link?.dxUserId) {
+    return {
+      ready: false,
+      platform: labelPlatform(config.dxfeed.provisioning.platform),
+      platformId: config.dxfeed.provisioning.platform,
+      downloadLink: null,
+      loginUrl: null,
+      username: null,
+      connectionServer: config.dxfeed.provisioning.connectionServer,
+    };
+  }
+
+  if (!link.userId && opts.userId) {
+    link.userId = opts.userId;
+  }
+
+  await enrichDownloadAndLogin(link);
+  await upsertDxFeedLink(link);
+
+  const downloadLink = link.downloadLink?.trim() || null;
+  const loginUrl = link.loginUrl?.trim() || null;
+  const ready = Boolean(downloadLink || loginUrl);
+
+  return {
+    ready,
+    platform: labelPlatform(link.platform ?? config.dxfeed.provisioning.platform),
+    platformId: link.platform ?? config.dxfeed.provisioning.platform,
+    downloadLink,
+    loginUrl,
+    username: link.platformUsername?.trim() || null,
+    connectionServer: config.dxfeed.provisioning.connectionServer,
+  };
 }
 
 function subscriptionPayload(userId: string, redirectUrl?: string) {

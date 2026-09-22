@@ -18,6 +18,7 @@ import {
   provisionForOnboarding,
   refreshAgreementStatus,
   resetForOnboarding,
+  resolvePlatformAccessForTrader,
 } from "../dxfeed/provision.js";
 import {
   notifyMakeAfterAgreementSigned,
@@ -693,6 +694,49 @@ export async function handleOnboardingComplete(
     makeOk,
     ...(makeReason && !makeOk ? { makeReason } : {}),
   });
+}
+
+/**
+ * Authenticated trader dashboard: Deepchart download link + fresh one-time SSO login.
+ */
+export async function handlePlatformAccess(
+  req: IncomingMessage,
+  res: ServerResponse,
+  auth: AuthService,
+  json: JsonFn,
+): Promise<void> {
+  const header = req.headers.authorization;
+  const token = typeof header === "string" && header.startsWith("Bearer ")
+    ? header.slice(7).trim()
+    : "";
+  if (!token) return json(res, 401, { error: "Not authenticated." });
+
+  const me = await auth.me(token);
+  if (!me) return json(res, 401, { error: "invalid or expired token" });
+
+  try {
+    const access = await resolvePlatformAccessForTrader({
+      userId: me.id,
+      email: me.email,
+    });
+    if (!access) {
+      json(res, 200, {
+        ok: true,
+        ready: false,
+        platform: "Deepchart",
+        downloadLink: null,
+        loginUrl: null,
+        username: null,
+        connectionServer: null,
+        note: "Platform access is not configured on this server.",
+      });
+      return;
+    }
+    json(res, 200, { ok: true, ...access });
+  } catch (err) {
+    console.error("[platform-access]", (err as Error).message);
+    json(res, 502, { error: "Could not load platform access." });
+  }
 }
 
 /**
