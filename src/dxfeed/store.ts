@@ -7,6 +7,9 @@ export interface DxFeedLink {
   orderNumber: string;
   userId: string | null;
   email: string;
+  /** From onboarding form — used in Make.com email greeting. */
+  firstName: string | null;
+  lastName: string | null;
   dxUserId: string;
   dxAccountId: string | null;
   dxSubscriptionId: string | null;
@@ -28,7 +31,7 @@ export interface DxFeedLink {
 export type DxFeedLinkInput = DxFeedLink;
 
 const COLS =
-  `"orderNumber","userId","email","dxUserId","dxAccountId","dxSubscriptionId","accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform","platformUsername","platformPassword","platformLicense","downloadLink","loginUrl","credentialsEmailedAt"`;
+  `"orderNumber","userId","email","firstName","lastName","dxUserId","dxAccountId","dxSubscriptionId","accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform","platformUsername","platformPassword","platformLicense","downloadLink","loginUrl","credentialsEmailedAt"`;
 
 const memory = new Map<string, DxFeedLink>();
 
@@ -37,6 +40,8 @@ function mapRow(r: Record<string, unknown>): DxFeedLink {
     orderNumber: String(r.orderNumber),
     userId: (r.userId as string | null) ?? null,
     email: String(r.email),
+    firstName: (r.firstName as string | null) ?? null,
+    lastName: (r.lastName as string | null) ?? null,
     dxUserId: String(r.dxUserId),
     dxAccountId: (r.dxAccountId as string | null) ?? null,
     dxSubscriptionId: (r.dxSubscriptionId as string | null) ?? null,
@@ -56,8 +61,10 @@ function mapRow(r: Record<string, unknown>): DxFeedLink {
   };
 }
 
-function emptyCreds(): Pick<
+function emptyExtras(): Pick<
   DxFeedLink,
+  | "firstName"
+  | "lastName"
   | "platformUsername"
   | "platformPassword"
   | "platformLicense"
@@ -66,6 +73,8 @@ function emptyCreds(): Pick<
   | "credentialsEmailedAt"
 > {
   return {
+    firstName: null,
+    lastName: null,
     platformUsername: null,
     platformPassword: null,
     platformLicense: null,
@@ -159,7 +168,7 @@ export async function getLinkByAccountId(dxAccountId: string): Promise<DxFeedLin
 
 export async function upsertDxFeedLink(link: DxFeedLinkInput): Promise<void> {
   const row: DxFeedLink = {
-    ...emptyCreds(),
+    ...emptyExtras(),
     ...link,
   };
   if (!useDatabase) {
@@ -168,13 +177,15 @@ export async function upsertDxFeedLink(link: DxFeedLinkInput): Promise<void> {
   }
   await getPool().query(
     `INSERT INTO "DxFeedAccount"
-       ("orderNumber","userId","email","dxUserId","dxAccountId","dxSubscriptionId",
+       ("orderNumber","userId","email","firstName","lastName","dxUserId","dxAccountId","dxSubscriptionId",
         "accountStatus","subscriptionStatus","agreementSigned","agreementLink","platform",
         "platformUsername","platformPassword","platformLicense","downloadLink","loginUrl","credentialsEmailedAt","updatedAt")
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now())
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,now())
      ON CONFLICT ("orderNumber") DO UPDATE SET
        "userId" = COALESCE(EXCLUDED."userId", "DxFeedAccount"."userId"),
        "email" = EXCLUDED."email",
+       "firstName" = COALESCE(EXCLUDED."firstName", "DxFeedAccount"."firstName"),
+       "lastName" = COALESCE(EXCLUDED."lastName", "DxFeedAccount"."lastName"),
        "dxUserId" = EXCLUDED."dxUserId",
        "dxAccountId" = EXCLUDED."dxAccountId",
        "dxSubscriptionId" = EXCLUDED."dxSubscriptionId",
@@ -191,8 +202,8 @@ export async function upsertDxFeedLink(link: DxFeedLinkInput): Promise<void> {
        "credentialsEmailedAt" = COALESCE(EXCLUDED."credentialsEmailedAt", "DxFeedAccount"."credentialsEmailedAt"),
        "updatedAt" = now()`,
     [
-      row.orderNumber, row.userId, row.email, row.dxUserId, row.dxAccountId,
-      row.dxSubscriptionId, row.accountStatus, row.subscriptionStatus,
+      row.orderNumber, row.userId, row.email, row.firstName, row.lastName,
+      row.dxUserId, row.dxAccountId, row.dxSubscriptionId, row.accountStatus, row.subscriptionStatus,
       row.agreementSigned, row.agreementLink, row.platform,
       row.platformUsername, row.platformPassword, row.platformLicense,
       row.downloadLink, row.loginUrl, row.credentialsEmailedAt,

@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import {
   getDxFeedLinkByOrder,
   markCredentialsEmailed,
+  upsertDxFeedLink,
   type DxFeedLink,
 } from "./store.js";
 import { Platform } from "./types.js";
@@ -32,6 +33,8 @@ export async function notifyMakePlatformCredentials(input: {
   orderNumber: string;
   email: string;
   name: string;
+  firstName?: string;
+  lastName?: string;
   /** Override payload source (default: dxfeed-agreement-signed). */
   source?: string;
   /**
@@ -45,6 +48,25 @@ export async function notifyMakePlatformCredentials(input: {
     const reason = "MAKE_PLATFORM_CREDENTIALS_WEBHOOK_URL unset";
     console.warn(`[make] ${reason} — skipping platform credentials email`);
     return { ok: false, reason };
+  }
+
+  // Persist form first/last name before prepare so Make never greets from email local-part.
+  const fn = input.firstName?.trim() || "";
+  const ln = input.lastName?.trim() || "";
+  if (fn || ln) {
+    try {
+      const existing = await getDxFeedLinkByOrder(input.orderNumber);
+      if (existing) {
+        if (fn) existing.firstName = fn;
+        if (ln) existing.lastName = ln;
+        await upsertDxFeedLink(existing);
+      }
+    } catch (err) {
+      console.warn(
+        `[make] could not persist name for order ${input.orderNumber}:`,
+        (err as Error).message.slice(0, 160),
+      );
+    }
   }
 
   // Always refresh/create subscription + credentials before send.
@@ -125,14 +147,19 @@ export async function notifyMakePlatformCredentials(input: {
 export async function notifyMakeAfterAgreementSigned(orderNumber: string): Promise<MakeNotifyResult> {
   const link = await getDxFeedLinkByOrder(orderNumber);
   const email = link?.email ?? "";
-  const name = email.includes("@")
-    ? email.split("@")[0]!.replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
-    : "Trader";
+  const firstName = link?.firstName?.trim() || "";
+  const lastName = link?.lastName?.trim() || "";
+  const name = [firstName, lastName].filter(Boolean).join(" ")
+    || (email.includes("@")
+      ? email.split("@")[0]!.replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+      : "Trader");
 
   return notifyMakePlatformCredentials({
     orderNumber,
     email: email || "unknown@example.com",
     name,
+    firstName: firstName || undefined,
+    lastName: lastName || undefined,
     source: "dxfeed-agreement-signed",
     requireAgreementSigned: true,
   });
@@ -140,7 +167,14 @@ export async function notifyMakeAfterAgreementSigned(orderNumber: string): Promi
 
 export function buildCredentialsPayload(
   link: DxFeedLink,
-  input: { orderNumber: string; email: string; name: string; source?: string },
+  input: {
+    orderNumber: string;
+    email: string;
+    name: string;
+    firstName?: string;
+    lastName?: string;
+    source?: string;
+  },
 ): Record<string, unknown> {
   const platformId = link.platform ?? config.dxfeed.provisioning.platform;
   const platform = platformLabel(platformId);
@@ -162,6 +196,10 @@ export function buildCredentialsPayload(
     || "";
   const license = link.platformLicense || "";
 
+  const firstName = (input.firstName ?? link.firstName ?? "").trim();
+  const lastName = (input.lastName ?? link.lastName ?? "").trim();
+  const name = [firstName, lastName].filter(Boolean).join(" ") || input.name;
+
   return {
     source: input.source ?? "dxfeed-agreement-signed",
     event: "platform_credentials",
@@ -171,8 +209,14 @@ export function buildCredentialsPayload(
     orderNumberDisplay: `#${input.orderNumber}`,
     email: input.email,
     Email: input.email,
-    name: input.name,
-    Name: input.name,
+    name,
+    Name: name,
+    firstName,
+    FirstName: firstName,
+    first_name: firstName,
+    lastName,
+    LastName: lastName,
+    last_name: lastName,
     platform,
     Platform: platform,
     platformId,

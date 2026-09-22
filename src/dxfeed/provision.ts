@@ -22,6 +22,8 @@ function makePlatformPassword(): string {
 
 function emptyPlatformCreds(): Pick<
   DxFeedLink,
+  | "firstName"
+  | "lastName"
   | "platformUsername"
   | "platformPassword"
   | "platformLicense"
@@ -30,6 +32,8 @@ function emptyPlatformCreds(): Pick<
   | "credentialsEmailedAt"
 > {
   return {
+    firstName: null,
+    lastName: null,
     platformUsername: null,
     platformPassword: null,
     platformLicense: null,
@@ -116,6 +120,8 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     ...emptyPlatformCreds(),
   };
   link.email = email;
+  link.firstName = firstName;
+  link.lastName = lastName;
 
   if (!link.dxUserId) {
     await createOrRefreshPlatformUser(link, {
@@ -346,6 +352,8 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
         orderNumber: input.orderNumber,
         userId: null,
         email,
+        firstName: input.firstName.trim() || donorCreds?.firstName || null,
+        lastName: input.lastName.trim() || donorCreds?.lastName || null,
         dxUserId,
         dxAccountId: links.find((l) => l.dxAccountId)?.dxAccountId ?? null,
         dxSubscriptionId: remote.subscriptionId ?? null,
@@ -481,8 +489,16 @@ export async function preparePlatformCredentialsAfterAgreement(
   if (!link?.dxUserId) return null;
 
   const email = link.email.trim().toLowerCase();
-  const local = email.split("@")[0] || "Trader";
-  const parts = local.replace(/[._0-9]+/g, " ").trim().split(/\s+/).filter(Boolean);
+  // Prefer onboarding-form names stored on the link; email local-part is last-resort only.
+  const firstName =
+    link.firstName?.trim()
+    || email.split("@")[0]?.replace(/[._0-9]+/g, " ").trim().split(/\s+/).filter(Boolean)[0]
+    || "Trader";
+  const lastName =
+    link.lastName?.trim()
+    || "Account";
+  if (!link.firstName) link.firstName = firstName;
+  if (!link.lastName) link.lastName = lastName;
 
   try {
     await ensureV2SubscribedAccount(link, agreementRedirectUrl(orderNumber));
@@ -496,8 +512,8 @@ export async function preparePlatformCredentialsAfterAgreement(
   await ensurePlatformCredentials(link, {
     orderNumber,
     email,
-    firstName: parts[0] || "Trader",
-    lastName: parts.slice(1).join(" ") || "Account",
+    firstName,
+    lastName,
     country: config.dxfeed.provisioning.country,
   });
 
@@ -687,6 +703,8 @@ async function adoptExistingSubscriptionForOrder(
     orderNumber,
     userId: null,
     email,
+    firstName: donor?.firstName ?? null,
+    lastName: donor?.lastName ?? null,
     dxUserId,
     dxAccountId: donor?.dxAccountId ?? null,
     dxSubscriptionId: subscriptionId,
