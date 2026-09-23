@@ -63,8 +63,10 @@ export interface NewUserInput {
 
 export interface NewTradingAccountInput {
   userId: string;
-  balance: number;
-  currency: Currency;
+  /** Optional when a trading rule supplies starting balance. */
+  balance?: number;
+  /** Optional when a trading rule supplies currency — Volumetrica rejects account-level currency with a rule. */
+  currency?: Currency;
   accountRuleReference?: IdReference;
   accountRuleId?: string;
   enabled?: boolean;
