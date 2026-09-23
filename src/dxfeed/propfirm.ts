@@ -110,6 +110,18 @@ export class PropfirmClient {
     return this.call<NewTradingAccountResult>("CreateTradingAccount", { method: "POST", body: input });
   }
 
+  /**
+   * Associate an org trading rule with an existing account.
+   * GET /api/Propsite/ChangeTradingRuleForAccount?accountId=&ruleId=
+   * @see https://dxfeed.volumetricaprop.com/swagger/index.html
+   */
+  async changeTradingRuleForAccount(accountId: string, ruleId: string): Promise<void> {
+    await this.call<unknown>("ChangeTradingRuleForAccount", {
+      method: "GET",
+      query: { accountId, ruleId },
+    });
+  }
+
   newSubscription(input: NewSubscriptionInput): Promise<SubscriptionResult> {
     return this.call<SubscriptionResult>("NewSubscription", { method: "POST", body: input });
   }
