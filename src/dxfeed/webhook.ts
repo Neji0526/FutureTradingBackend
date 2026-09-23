@@ -108,10 +108,8 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
           void ensureVolumetricaTradingRule(link).catch((e) => {
             console.error("[dxfeed webhook] ensure trading rule failed:", (e as Error).message);
           });
-          const { notifyMakeAfterAgreementSigned } = await import("./make-credentials.js");
-          void notifyMakeAfterAgreementSigned(link.orderNumber).catch((e) => {
-            console.error("[dxfeed webhook] Make after agreement failed:", (e as Error).message);
-          });
+          // Make.com is NOT notified here — only on Complete onboarding
+          // (avoids duplicate credential emails on re-sign / webhook retries).
         }
       }
       return;

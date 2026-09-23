@@ -162,7 +162,8 @@ export async function notifyMakePlatformCredentials(input: {
 }
 
 /**
- * When agreementSigned flips true: ensure platform creds + license/SSO, then notify Make.
+ * Legacy helper — credentials email is sent only from Complete onboarding
+ * (`vault-signup-complete`). Kept for scripts/manual use; not called on agreement sign.
  */
 export async function notifyMakeAfterAgreementSigned(
   orderNumber: string,

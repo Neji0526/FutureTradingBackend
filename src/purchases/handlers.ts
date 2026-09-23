@@ -21,9 +21,9 @@ import {
   resolvePlatformAccessForTrader,
 } from "../dxfeed/provision.js";
 import {
-  notifyMakeAfterAgreementSigned,
   notifyMakePlatformCredentials,
 } from "../dxfeed/make-credentials.js";
+import { ensureVolumetricaTradingRule } from "../dxfeed/ensure-trading-rule.js";
 import { attachDxFeedUserId, getDxFeedLinkByOrder, getDxFeedLinksByEmail, upsertDxFeedLink } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
@@ -363,25 +363,13 @@ export async function handleDxFeedAgreementStatus(
     return;
   }
 
-  // After dxFeed agreement is signed → attach Phase 1 trading rule on Volumetrica,
-  // then Make.com emails Deepchart credentials.
+  // After dxFeed agreement is signed → attach Phase 1 trading rule on Volumetrica.
+  // Make.com credentials email is ONLY sent on Complete onboarding (not here — avoids
+  // duplicate passwords when the trader re-signs / polls status repeatedly).
   if (link.agreementSigned) {
-    void (async () => {
-      try {
-        const { ensureVolumetricaTradingRule } = await import("../dxfeed/ensure-trading-rule.js");
-        await ensureVolumetricaTradingRule(link);
-      } catch (e) {
-        console.error("[onboarding] ensure trading rule after agreement failed:", (e as Error).message);
-      }
-      try {
-        await notifyMakeAfterAgreementSigned(orderNumber, {
-          firstName: firstName || link.firstName || undefined,
-          lastName: lastName || link.lastName || undefined,
-        });
-      } catch (e) {
-        console.error("[onboarding] Make after agreement failed:", (e as Error).message);
-      }
-    })();
+    void ensureVolumetricaTradingRule(link).catch((e) => {
+      console.error("[onboarding] ensure trading rule after agreement failed:", (e as Error).message);
+    });
   }
 
   json(res, 200, {
@@ -666,9 +654,8 @@ export async function handleOnboardingComplete(
     }
   }
 
-  // After Vault signup: AWAIT send to second Make.com webhook (not fire-and-forget).
-  // Previously void() returned 201 before Make ran — prepare/notify often never finished
-  // or skipped silently (missing password / stale flags).
+  // ONLY send Make.com credentials after Complete onboarding (agreement already
+  // verified above). Do not send on agreement sign / re-sign / status polls.
   let makeOk = false;
   let makeReason: string | undefined;
   if (dxfeedProvisionReady) {
