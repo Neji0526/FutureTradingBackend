@@ -135,25 +135,15 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   link.firstName = firstName;
   link.lastName = lastName;
 
-  if (!link.dxUserId) {
-    await createOrRefreshPlatformUser(link, {
-      firstName,
-      lastName,
-      email,
-      country,
-      orderNumber: input.orderNumber,
-      forceNewPassword: false,
-    });
-  } else if (!link.platformUsername || !link.platformPassword) {
-    await createOrRefreshPlatformUser(link, {
-      firstName,
-      lastName,
-      email,
-      country,
-      orderNumber: input.orderNumber,
-      forceNewPassword: true,
-    });
-  }
+  // Always ensure a live Volumetrica user exists (V2 User). Stale local dxUserId
+  // after Reset causes CreateTradingAccount 404 "User not found".
+  await ensureRemotePlatformUser(link, {
+    firstName,
+    lastName,
+    email,
+    country,
+    orderNumber: input.orderNumber,
+  });
 
   // Remote already has a sub (local id missing) — recover via GetSubscriptionStatus(userId).
   if (!link.dxSubscriptionId) {
@@ -174,14 +164,44 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     if (!link.dxUserId) {
       throw new Error("provisionForOnboarding: missing dxUserId before CreateTradingAccount");
     }
-    const acct = await propfirm.createTradingAccount({
-      userId: link.dxUserId,
-      balance: p.balance,
-      currency: Currency.USD,
-      enabled: true,
-      mode: AccountMode.EVALUATION,
-      description: `Vault ${input.orderNumber}`,
-    });
+    let acct;
+    try {
+      acct = await propfirm.createTradingAccount({
+        userId: link.dxUserId,
+        balance: p.balance,
+        currency: Currency.USD,
+        enabled: true,
+        mode: AccountMode.EVALUATION,
+        description: `Vault ${input.orderNumber}`,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Remote user vanished — recreate via V2 User and retry once.
+      if (/user not found/i.test(msg)) {
+        console.warn(
+          `[dxfeed] CreateTradingAccount user not found (${link.dxUserId.slice(0, 36)}) — recreate V2 User and retry`,
+        );
+        link.dxUserId = "";
+        await ensureRemotePlatformUser(link, {
+          firstName,
+          lastName,
+          email,
+          country,
+          orderNumber: input.orderNumber,
+          forceRecreate: true,
+        });
+        acct = await propfirm.createTradingAccount({
+          userId: link.dxUserId,
+          balance: p.balance,
+          currency: Currency.USD,
+          enabled: true,
+          mode: AccountMode.EVALUATION,
+          description: `Vault ${input.orderNumber}`,
+        });
+      } else {
+        throw err;
+      }
+    }
     if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
     link.dxAccountId = acct.accountId;
     await upsertDxFeedLink(link);
@@ -283,7 +303,7 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
   );
 
   try {
-    const user = await propfirm.newUser({
+    const user = await propfirm.createUserV2({
       firstName: input.firstName.trim() || "Trader",
       lastName: input.lastName.trim() || "Account",
       email,
@@ -294,7 +314,7 @@ export async function resetForOnboarding(input: OnboardingProvisionInput): Promi
     });
     if (user.userId) dxUserId = user.userId;
   } catch (err) {
-    notes.push(`NewUser lookup warn: ${(err as Error).message.slice(0, 160)}`);
+    notes.push(`V2 User lookup warn: ${(err as Error).message.slice(0, 160)}`);
   }
 
   if (!dxUserId) {
@@ -795,25 +815,70 @@ async function adoptExistingSubscriptionForOrder(
 
 /**
  * Ensure Deepchart / ATAS / Quantower username+password exist on the link.
- * Mints via NewUser(passwordToSet); rotates only when we have no stored password.
+ * Uses V2 Propsite/User; recreates when local dxUserId is stale on Volumetrica.
  */
 async function ensurePlatformCredentials(
   link: DxFeedLinkInput,
   input: OnboardingProvisionInput,
 ): Promise<void> {
   const country = (input.country.trim().toUpperCase() || config.dxfeed.provisioning.country).slice(0, 2);
-  if (!link.platformUsername || !link.platformPassword) {
-    await createOrRefreshPlatformUser(link, {
-      firstName: input.firstName.trim() || "Trader",
-      lastName: input.lastName.trim() || "Account",
-      email: input.email.trim().toLowerCase(),
-      country,
-      orderNumber: input.orderNumber,
-      forceNewPassword: Boolean(link.dxUserId),
-    });
-  }
+  await ensureRemotePlatformUser(link, {
+    firstName: input.firstName.trim() || "Trader",
+    lastName: input.lastName.trim() || "Account",
+    email: input.email.trim().toLowerCase(),
+    country,
+    orderNumber: input.orderNumber,
+  });
   await enrichDownloadAndLogin(link);
   await upsertDxFeedLink(link);
+}
+
+/**
+ * Verify/create Volumetrica user via V2 APIs before CreateTradingAccount / subscription.
+ * @see https://dxfeed.volumetricaprop.com/swagger/index.html — GET/POST/PUT /api/v2/Propsite/User
+ */
+async function ensureRemotePlatformUser(
+  link: DxFeedLinkInput,
+  opts: {
+    firstName: string;
+    lastName: string;
+    email: string;
+    country: string;
+    orderNumber: string;
+    forceRecreate?: boolean;
+  },
+): Promise<void> {
+  if (link.dxUserId && !opts.forceRecreate) {
+    const remote = await propfirm.getUserV2(link.dxUserId);
+    if (remote) {
+      if (!link.platformUsername || !link.platformPassword) {
+        await createOrRefreshPlatformUser(link, {
+          firstName: opts.firstName,
+          lastName: opts.lastName,
+          email: opts.email,
+          country: opts.country,
+          orderNumber: opts.orderNumber,
+          forceNewPassword: true,
+        });
+      }
+      return;
+    }
+    console.warn(
+      `[dxfeed] local dxUserId ${link.dxUserId.slice(0, 36)} not found on Volumetrica — creating new V2 user`,
+    );
+    link.dxUserId = "";
+    // Stale account id cannot be reused under a new user.
+    link.dxAccountId = null;
+  }
+
+  await createOrRefreshPlatformUser(link, {
+    firstName: opts.firstName,
+    lastName: opts.lastName,
+    email: opts.email,
+    country: opts.country,
+    orderNumber: opts.orderNumber,
+    forceNewPassword: Boolean(link.dxUserId),
+  });
 }
 
 async function createOrRefreshPlatformUser(
@@ -828,7 +893,7 @@ async function createOrRefreshPlatformUser(
   },
 ): Promise<void> {
   const password = makePlatformPassword();
-  const user = await propfirm.newUser({
+  const body = {
     firstName: opts.firstName,
     lastName: opts.lastName,
     email: opts.email,
@@ -838,9 +903,27 @@ async function createOrRefreshPlatformUser(
     userType: UserType.USER,
     passwordToSet: password,
     ...(opts.forceNewPassword ? { forceNewPassword: true } : {}),
-  });
+  };
+
+  let user: Awaited<ReturnType<typeof propfirm.createUserV2>>;
+  if (link.dxUserId && opts.forceNewPassword) {
+    try {
+      user = await propfirm.updateUserV2(link.dxUserId, body);
+    } catch (err) {
+      if (err instanceof DxFeedApiError && (err.status === 404 || /not found/i.test(err.message))) {
+        link.dxUserId = "";
+        link.dxAccountId = null;
+        user = await propfirm.createUserV2({ ...body, forceNewPassword: false });
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    user = await propfirm.createUserV2(body);
+  }
+
   if (!user.userId && !link.dxUserId) {
-    throw new Error("provisionForOnboarding: NewUser returned no userId");
+    throw new Error("provisionForOnboarding: V2 User returned no userId");
   }
   if (user.userId) link.dxUserId = user.userId;
   link.platformUsername = user.username?.trim() || opts.email;
