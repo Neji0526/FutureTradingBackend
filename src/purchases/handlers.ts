@@ -363,15 +363,25 @@ export async function handleDxFeedAgreementStatus(
     return;
   }
 
-  // After dxFeed agreement is signed → Make.com emails Deepchart/ATAS/Quantower credentials.
-  // Not shown in the browser; ClickFunnels Make scenario is separate.
+  // After dxFeed agreement is signed → attach Phase 1 trading rule on Volumetrica,
+  // then Make.com emails Deepchart credentials.
   if (link.agreementSigned) {
-    void notifyMakeAfterAgreementSigned(orderNumber, {
-      firstName: firstName || link.firstName || undefined,
-      lastName: lastName || link.lastName || undefined,
-    }).catch((e) => {
-      console.error("[onboarding] Make after agreement failed:", (e as Error).message);
-    });
+    void (async () => {
+      try {
+        const { ensureVolumetricaTradingRule } = await import("../dxfeed/ensure-trading-rule.js");
+        await ensureVolumetricaTradingRule(link);
+      } catch (e) {
+        console.error("[onboarding] ensure trading rule after agreement failed:", (e as Error).message);
+      }
+      try {
+        await notifyMakeAfterAgreementSigned(orderNumber, {
+          firstName: firstName || link.firstName || undefined,
+          lastName: lastName || link.lastName || undefined,
+        });
+      } catch (e) {
+        console.error("[onboarding] Make after agreement failed:", (e as Error).message);
+      }
+    })();
   }
 
   json(res, 200, {

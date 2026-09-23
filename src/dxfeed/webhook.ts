@@ -104,6 +104,10 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
         await upsertDxFeedLink(link);
         if (sub.dxAgreementSigned) {
           console.log(`[dxfeed] user ${link.dxUserId} SIGNED the data agreement (order ${link.orderNumber})`);
+          const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
+          void ensureVolumetricaTradingRule(link).catch((e) => {
+            console.error("[dxfeed webhook] ensure trading rule failed:", (e as Error).message);
+          });
           const { notifyMakeAfterAgreementSigned } = await import("./make-credentials.js");
           void notifyMakeAfterAgreementSigned(link.orderNumber).catch((e) => {
             console.error("[dxfeed webhook] Make after agreement failed:", (e as Error).message);
