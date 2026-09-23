@@ -11,7 +11,7 @@ import {
   type DxFeedLinkInput,
 } from "./store.js";
 import {
-  AccountMode, Currency, EncryptionMode, IdReference, UserType,
+  AccountMode, Currency, EncryptionMode, UserType,
   type DataFeedProduct, type Platform,
 } from "./types.js";
 
@@ -169,54 +169,24 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   }
 
   if (!link.dxAccountId) {
-    const {
-      resolvePhase1TradingRuleId,
-      clearPhase1TradingRuleCache,
-      ensureVolumetricaTradingRule,
-    } = await import("./ensure-trading-rule.js");
-    let resolvedRuleId = await resolvePhase1TradingRuleId();
-    if (!resolvedRuleId) {
-      console.warn(
-        "[dxfeed] Phase1 trading rule UUID unset — CreateTradingAccount without accountRuleId. " +
-          "Set DXFEED_DEFAULT_RULE_ID to the Volumetrica Trading Rule UUID, or ensure TradingRule/List sync.",
-      );
+    // Create account without trading rule here — rule is attached on Complete onboarding
+    // via ChangeTradingRuleForAccount (avoids Prepare-agreement failures from bad rule ids).
+    if (!link.dxUserId) {
+      throw new Error("provisionForOnboarding: missing dxUserId before CreateTradingAccount");
     }
-
-    const buildCreateBody = (rule: string | null) => ({
+    const acct = await propfirm.createTradingAccount({
       userId: link.dxUserId,
+      balance: p.balance,
+      currency: Currency.USD,
       enabled: true,
       mode: AccountMode.EVALUATION,
       description: `Vault ${input.orderNumber}`,
-      // With a trading rule, currency/balance come from the rule (Volumetrica 400 if set on account).
-      ...(rule
-        ? { accountRuleReference: IdReference.ORGANIZATION, accountRuleId: rule }
-        : { balance: p.balance, currency: Currency.USD }),
     });
-
-    let acct;
-    try {
-      acct = await propfirm.createTradingAccount(buildCreateBody(resolvedRuleId));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // Stale / wrong rule id → recreate without rule, then ChangeTradingRuleForAccount.
-      if (resolvedRuleId && /trading rule not found/i.test(msg)) {
-        console.warn(
-          `[dxfeed] CreateTradingAccount rule not found (${resolvedRuleId.slice(0, 36)}) — retry without rule, then attach`,
-        );
-        clearPhase1TradingRuleCache();
-        resolvedRuleId = null;
-        acct = await propfirm.createTradingAccount(buildCreateBody(null));
-      } else {
-        throw err;
-      }
-    }
     if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
     link.dxAccountId = acct.accountId;
     await upsertDxFeedLink(link);
 
-    // Attach Phase 1 if create ran without rule, or refresh after create-with-rule.
-    const attached = await ensureVolumetricaTradingRule(link);
-    const syncId = (attached.ruleId ?? acct.tradingRuleId ?? resolvedRuleId)?.trim();
+    const syncId = acct.tradingRuleId?.trim();
     if (syncId) {
       const { syncTradingRuleById } = await import("./trading-rules-sync.js");
       const synced = await syncTradingRuleById(syncId);
@@ -506,14 +476,7 @@ export async function refreshAgreementStatus(orderNumber: string): Promise<DxFee
         console.log(
           `[dxfeed] order ${orderNumber} agreementSigned synced from Propfirm → true`,
         );
-        // Sign agreement → attach 50K Evaluation (Phase 1) on Volumetrica account.
-        const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
-        void ensureVolumetricaTradingRule(link).catch((e) => {
-          console.warn(
-            `[dxfeed] ensure trading rule after sign order ${orderNumber}:`,
-            (e as Error).message.slice(0, 200),
-          );
-        });
+        // Trading rule is attached on Complete onboarding (not on sign).
       }
     }
   } catch (err) {
@@ -560,19 +523,6 @@ export async function preparePlatformCredentialsAfterAgreement(
     lastName,
     country: config.dxfeed.provisioning.country,
   });
-
-  // Agreement already signed at this point — ensure Volumetrica has Phase 1 rule.
-  if (link.agreementSigned) {
-    try {
-      const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
-      await ensureVolumetricaTradingRule(link);
-    } catch (err) {
-      console.warn(
-        `[dxfeed] ensure trading rule prepare order ${orderNumber}:`,
-        (err as Error).message.slice(0, 200),
-      );
-    }
-  }
 
   await enrichDownloadAndLogin(link);
   await upsertDxFeedLink(link);
