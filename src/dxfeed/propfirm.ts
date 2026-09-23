@@ -78,6 +78,48 @@ export class PropfirmClient {
     return this.request<T>(`/api/v2/Propsite/${path}`, label, opts);
   }
 
+  /**
+   * V2 GET /api/v2/Propsite/User?userId= — returns null when user does not exist.
+   * @see https://dxfeed.volumetricaprop.com/swagger/index.html
+   */
+  async getUserV2(userId: string): Promise<Record<string, unknown> | null> {
+    const id = userId.trim();
+    if (!id) return null;
+    try {
+      const data = await this.callV2<Record<string, unknown> | null>("User", {
+        method: "GET",
+        query: { userId: id },
+      });
+      if (!data || typeof data !== "object") return null;
+      return data;
+    } catch (err) {
+      if (err instanceof DxFeedApiError && (err.status === 404 || /not found/i.test(err.message))) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * V2 POST /api/v2/Propsite/User — create user (prefer over V1 NewUser for new flows).
+   * Prefill country/name so agreement signing works.
+   */
+  async createUserV2(input: NewUserInput): Promise<UserResult> {
+    return this.callV2<UserResult>("User", { method: "POST", body: input });
+  }
+
+  /**
+   * V2 PUT /api/v2/Propsite/User?userId= — update existing user (e.g. rotate password).
+   */
+  async updateUserV2(userId: string, input: NewUserInput): Promise<UserResult> {
+    return this.callV2<UserResult>("User", {
+      method: "PUT",
+      query: { userId },
+      body: input,
+    });
+  }
+
+  /** @deprecated Prefer createUserV2 / updateUserV2 (V2 Propsite/User). */
   newUser(input: NewUserInput): Promise<UserResult> {
     return this.call<UserResult>("NewUser", { method: "POST", body: input });
   }
