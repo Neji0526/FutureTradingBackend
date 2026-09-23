@@ -113,7 +113,6 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   }
 
   const p = config.dxfeed.provisioning;
-  const ruleId = p.ruleId;
   const country = (input.country.trim().toUpperCase() || p.country).slice(0, 2);
   const firstName = input.firstName.trim() || "Trader";
   const lastName = input.lastName.trim() || "Account";
@@ -170,30 +169,54 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   }
 
   if (!link.dxAccountId) {
-    const { resolvePhase1TradingRuleId } = await import("./ensure-trading-rule.js");
-    const resolvedRuleId = (await resolvePhase1TradingRuleId()) || ruleId;
+    const {
+      resolvePhase1TradingRuleId,
+      clearPhase1TradingRuleCache,
+      ensureVolumetricaTradingRule,
+    } = await import("./ensure-trading-rule.js");
+    let resolvedRuleId = await resolvePhase1TradingRuleId();
     if (!resolvedRuleId) {
       console.warn(
         "[dxfeed] Phase1 trading rule UUID unset — CreateTradingAccount without accountRuleId. " +
           "Set DXFEED_DEFAULT_RULE_ID to the Volumetrica Trading Rule UUID, or ensure TradingRule/List sync.",
       );
     }
-    const acct = await propfirm.createTradingAccount({
+
+    const buildCreateBody = (rule: string | null) => ({
       userId: link.dxUserId,
       enabled: true,
       mode: AccountMode.EVALUATION,
       description: `Vault ${input.orderNumber}`,
       // With a trading rule, currency/balance come from the rule (Volumetrica 400 if set on account).
-      ...(resolvedRuleId
-        ? { accountRuleReference: IdReference.ORGANIZATION, accountRuleId: resolvedRuleId }
+      ...(rule
+        ? { accountRuleReference: IdReference.ORGANIZATION, accountRuleId: rule }
         : { balance: p.balance, currency: Currency.USD }),
     });
+
+    let acct;
+    try {
+      acct = await propfirm.createTradingAccount(buildCreateBody(resolvedRuleId));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Stale / wrong rule id → recreate without rule, then ChangeTradingRuleForAccount.
+      if (resolvedRuleId && /trading rule not found/i.test(msg)) {
+        console.warn(
+          `[dxfeed] CreateTradingAccount rule not found (${resolvedRuleId.slice(0, 36)}) — retry without rule, then attach`,
+        );
+        clearPhase1TradingRuleCache();
+        resolvedRuleId = null;
+        acct = await propfirm.createTradingAccount(buildCreateBody(null));
+      } else {
+        throw err;
+      }
+    }
     if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
     link.dxAccountId = acct.accountId;
     await upsertDxFeedLink(link);
 
-    // Mirror that rule into Vault RuleTemplate via REST (not webhook).
-    const syncId = (acct.tradingRuleId ?? resolvedRuleId)?.trim();
+    // Attach Phase 1 if create ran without rule, or refresh after create-with-rule.
+    const attached = await ensureVolumetricaTradingRule(link);
+    const syncId = (attached.ruleId ?? acct.tradingRuleId ?? resolvedRuleId)?.trim();
     if (syncId) {
       const { syncTradingRuleById } = await import("./trading-rules-sync.js");
       const synced = await syncTradingRuleById(syncId);
