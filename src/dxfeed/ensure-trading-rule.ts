@@ -1,42 +1,40 @@
 /**
- * Ensure Volumetrica trading accounts get the org Phase 1 rule (50K Evaluation)
- * when the trader signs the dxFeed market-data agreement.
+ * Attach Evaluation (Phase 1) trading rule after Vault onboarding completes.
+ * Does not run during Prepare / sign agreement.
  *
- * Uses Propsite V1 ChangeTradingRuleForAccount:
- *   GET /api/Propsite/ChangeTradingRuleForAccount?accountId=&ruleId=
+ * Primary: load all rules from V2 TradingRule/List and pick Phase 1.
+ * DXFEED_DEFAULT_RULE_ID is optional and not required.
+ *
+ * GET /api/Propsite/ChangeTradingRuleForAccount?accountId=&ruleId=
  * @see https://dxfeed.volumetricaprop.com/swagger/index.html
  */
 import { config, dxfeedProvisionReady, useDatabase } from "../config.js";
 import { getPool } from "../db/pool.js";
 import { propfirm } from "./propfirm.js";
-import type { DxFeedLink } from "./store.js";
+import { getDxFeedLinkByOrder, upsertDxFeedLink, type DxFeedLink } from "./store.js";
 import { syncTradingRuleById } from "./trading-rules-sync.js";
-
-const PHASE1_REFS = [
-  "PRIME_50K_EVAL_PHASE1",
-  "PRIME_50K_EVAL",
-  "50K - Evaluation (Phase 1)",
-] as const;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Process-lifetime cache (only stores GetTradingRule-verified UUIDs). */
 let cachedPhase1RuleId: string | null | undefined;
 
 function looksLikeRuleUuid(value: string): boolean {
   return UUID_RE.test(value.trim());
 }
 
-function extractRuleUuid(rule: Record<string, unknown>): string | null {
+function extractRuleId(rule: Record<string, unknown>): string | null {
   for (const key of ["ruleId", "RuleId", "id", "Id"] as const) {
     const v = rule[key];
-    if (typeof v === "string" && looksLikeRuleUuid(v)) return v.trim();
+    if (typeof v !== "string") continue;
+    const s = v.trim();
+    if (!s) continue;
+    if (looksLikeRuleUuid(s) || key.toLowerCase() === "ruleid") return s;
   }
   return null;
 }
 
-function isPhase1Rule(rule: Record<string, unknown>): boolean {
+function ruleLabels(rule: Record<string, unknown>): { ref: string; desc: string; hay: string } {
   const ref = String(
     rule.organizationReferenceId ?? rule.reference ?? rule.Reference ?? "",
   )
@@ -45,22 +43,55 @@ function isPhase1Rule(rule: Record<string, unknown>): boolean {
   const desc = String(rule.description ?? rule.Description ?? "")
     .trim()
     .toUpperCase();
-  return (
-    PHASE1_REFS.some((r) => ref === r.toUpperCase() || desc === r.toUpperCase())
-    || (ref.includes("50K") && (ref.includes("PHASE1") || ref.includes("PHASE_1")))
-    || (desc.includes("50K") && (desc.includes("PHASE 1") || desc.includes("PHASE1")))
-  );
+  return { ref, desc, hay: `${ref} ${desc}` };
 }
 
-/** Confirm ruleId exists in Volumetrica (avoids CreateTradingAccount 404). */
+/** Flexible Phase 1 match — naming varies across Volumetrica orgs. */
+function phase1Score(rule: Record<string, unknown>): number {
+  const { ref, desc, hay } = ruleLabels(rule);
+  if (!hay.trim()) return 0;
+
+  if (
+    /\bPHASE\s*2\b/.test(hay)
+    || /\bPHASE_2\b/.test(hay)
+    || /\bPHASE2\b/.test(hay)
+    || (/\bFUND/.test(hay) && !/\bEVAL/.test(hay))
+  ) {
+    return 0;
+  }
+
+  let score = 0;
+  if (ref === "PRIME_50K_EVAL_PHASE1" || desc === "50K - EVALUATION (PHASE 1)") score += 100;
+  if (/\bPHASE\s*1\b/.test(hay) || /\bPHASE_1\b/.test(hay) || /\bPHASE1\b/.test(hay)) score += 40;
+  if (/\bEVAL/.test(hay) || /\bEVALUATION\b/.test(hay) || /\bCHALLENGE\b/.test(hay)) score += 25;
+  if (/\b50K\b/.test(hay) || /\b50000\b/.test(hay)) score += 15;
+  if (ref.includes("EVAL_PHASE1") || ref.endsWith("PHASE1")) score += 20;
+  return score;
+}
+
+function pickPhase1FromList(
+  rules: Record<string, unknown>[],
+): { ruleId: string; score: number; label: string } | null {
+  let best: { ruleId: string; score: number; label: string } | null = null;
+  for (const rule of rules) {
+    const score = phase1Score(rule);
+    if (score < 40) continue;
+    const ruleId = extractRuleId(rule);
+    if (!ruleId) continue;
+    const { ref, desc } = ruleLabels(rule);
+    const label = desc || ref || ruleId;
+    if (!best || score > best.score) best = { ruleId, score, label };
+  }
+  return best;
+}
+
 async function verifyTradingRuleId(ruleId: string): Promise<string | null> {
   const id = ruleId.trim();
   if (!id) return null;
   try {
     const rule = await propfirm.getTradingRule(id);
     if (!rule || typeof rule !== "object") return null;
-    const verified = extractRuleUuid(rule as Record<string, unknown>) || id;
-    return verified;
+    return extractRuleId(rule) || id;
   } catch (err) {
     console.warn(
       `[dxfeed] GetTradingRule(${id.slice(0, 36)}) failed:`,
@@ -75,109 +106,129 @@ export function clearPhase1TradingRuleCache(): void {
 }
 
 /**
- * Resolve Volumetrica Trading Rule UUID for 50K Evaluation (Phase 1).
- * Only returns ids that GetTradingRule accepts (prevents "Trading rule not found").
+ * Resolve Evaluation Phase 1 rule id.
+ * 1) Live TradingRule/List (required path — no env needed)
+ * 2) Optional DXFEED_DEFAULT_RULE_ID
+ * 3) Synced RuleTemplate rows
  */
 export async function resolvePhase1TradingRuleId(): Promise<string | null> {
   if (cachedPhase1RuleId !== undefined) return cachedPhase1RuleId;
 
-  const candidates: string[] = [];
-  const push = (v: string | null | undefined) => {
-    const s = v?.trim();
-    if (!s || candidates.includes(s)) return;
-    candidates.push(s);
-  };
+  try {
+    const rules = await propfirm.listTradingRules();
+    const picked = pickPhase1FromList(rules);
+    if (picked) {
+      cachedPhase1RuleId = picked.ruleId;
+      console.log(
+        `[dxfeed] Phase1 from TradingRule/List ruleId=${picked.ruleId} score=${picked.score} label=${picked.label}`,
+      );
+      return picked.ruleId;
+    }
+    console.warn(
+      `[dxfeed] TradingRule/List returned ${rules.length} rule(s); none matched Evaluation Phase 1`,
+    );
+  } catch (err) {
+    console.warn("[dxfeed] TradingRule/List failed:", (err as Error).message.slice(0, 200));
+  }
 
-  push(config.dxfeed.provisioning.ruleId);
+  const fromEnv = config.dxfeed.provisioning.ruleId.trim();
+  if (fromEnv) {
+    const verified = await verifyTradingRuleId(fromEnv);
+    if (verified) {
+      cachedPhase1RuleId = verified;
+      console.log(`[dxfeed] Phase1 from DXFEED_DEFAULT_RULE_ID=${verified}`);
+      return verified;
+    }
+  }
 
   if (useDatabase) {
     try {
       const { rows } = await getPool().query<{ id: string; externalReference: string | null }>(
         `SELECT "id", "externalReference" FROM "RuleTemplate"
-         WHERE "id" = ANY($1::text[])
-            OR "externalReference" = ANY($1::text[])
-            OR upper(coalesce("label", '')) LIKE '%50K%PHASE 1%'
-            OR upper(coalesce("label", '')) LIKE '%50K%PHASE1%'
-         ORDER BY
-           CASE WHEN "source" = 'dxfeed' THEN 0 ELSE 1 END,
-           CASE WHEN "id" = 'PRIME_50K_EVAL_PHASE1' THEN 0 ELSE 1 END
-         LIMIT 5`,
-        [PHASE1_REFS as unknown as string[]],
+         WHERE "source" = 'dxfeed'
+            OR upper(coalesce("id", '')) LIKE '%PHASE1%'
+            OR upper(coalesce("label", '')) LIKE '%PHASE 1%'
+            OR upper(coalesce("label", '')) LIKE '%PHASE1%'
+         ORDER BY CASE WHEN "source" = 'dxfeed' THEN 0 ELSE 1 END
+         LIMIT 10`,
       );
       for (const row of rows) {
-        push(row.externalReference);
-        if (looksLikeRuleUuid(row.id)) push(row.id);
+        const ext = row.externalReference?.trim() || "";
+        if (ext) {
+          const verified = await verifyTradingRuleId(ext);
+          if (verified) {
+            cachedPhase1RuleId = verified;
+            return verified;
+          }
+        }
+        if (looksLikeRuleUuid(row.id)) {
+          const verified = await verifyTradingRuleId(row.id);
+          if (verified) {
+            cachedPhase1RuleId = verified;
+            return verified;
+          }
+        }
       }
     } catch (err) {
-      console.warn("[dxfeed] resolve Phase1 rule from DB:", (err as Error).message.slice(0, 160));
-    }
-  }
-
-  try {
-    const rules = await propfirm.listTradingRules();
-    for (const rule of rules) {
-      if (!isPhase1Rule(rule)) continue;
-      push(extractRuleUuid(rule));
-    }
-  } catch (err) {
-    console.warn("[dxfeed] resolve Phase1 rule via List:", (err as Error).message.slice(0, 200));
-  }
-
-  for (const candidate of candidates) {
-    // Prefer UUID-shaped ids first, then try opaque env values.
-    if (!looksLikeRuleUuid(candidate) && candidate !== config.dxfeed.provisioning.ruleId.trim()) {
-      continue;
-    }
-    const verified = await verifyTradingRuleId(candidate);
-    if (verified) {
-      cachedPhase1RuleId = verified;
-      console.log(`[dxfeed] Phase1 trading rule verified ruleId=${verified}`);
-      return verified;
-    }
-  }
-
-  // Last pass: any List Phase1 row UUID we haven't tried (already in candidates).
-  for (const candidate of candidates) {
-    const verified = await verifyTradingRuleId(candidate);
-    if (verified) {
-      cachedPhase1RuleId = verified;
-      console.log(`[dxfeed] Phase1 trading rule verified ruleId=${verified}`);
-      return verified;
+      console.warn("[dxfeed] resolve Phase1 from DB:", (err as Error).message.slice(0, 160));
     }
   }
 
   cachedPhase1RuleId = null;
   console.warn(
-    "[dxfeed] Phase1 trading rule UUID not found — set DXFEED_DEFAULT_RULE_ID to the Volumetrica rule UUID",
+    "[dxfeed] No Evaluation Phase 1 rule in TradingRule/List — add one in Volumetrica Admin",
   );
   return null;
 }
 
 /**
- * Attach 50K Evaluation (Phase 1) to the Volumetrica trading account.
- * Safe to call repeatedly (idempotent associate).
+ * Attach Evaluation Phase 1 on the Volumetrica trading account.
+ * Intended for Complete onboarding only.
  */
 export async function ensureVolumetricaTradingRule(
   link: Pick<DxFeedLink, "orderNumber" | "dxAccountId" | "dxUserId">,
-): Promise<{ ok: boolean; ruleId?: string; reason?: string }> {
+): Promise<{ ok: boolean; ruleId?: string; reason?: string; accountId?: string }> {
   if (!dxfeedProvisionReady) {
     return { ok: false, reason: "dxfeed not configured" };
   }
-  const accountId = link.dxAccountId?.trim();
+
+  let accountId = link.dxAccountId?.trim() || "";
+  if (!accountId && link.dxUserId) {
+    try {
+      const accounts = await propfirm.getUserAccounts(link.dxUserId);
+      const first = accounts.find((a) => typeof a.id === "string" && a.id.trim())?.id?.trim();
+      if (first) {
+        accountId = first;
+        // Persist discovered account id for later.
+        try {
+          const full = await getDxFeedLinkByOrder(link.orderNumber);
+          if (full && !full.dxAccountId) {
+            full.dxAccountId = first;
+            await upsertDxFeedLink(full);
+          }
+        } catch {
+          /* non-fatal */
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[dxfeed] GetUserAccounts order ${link.orderNumber}:`,
+        (err as Error).message.slice(0, 160),
+      );
+    }
+  }
   if (!accountId) {
     return { ok: false, reason: `no dxAccountId for order ${link.orderNumber}` };
   }
 
-  let ruleId = await resolvePhase1TradingRuleId();
-  if (!ruleId) {
-    clearPhase1TradingRuleCache();
-    ruleId = await resolvePhase1TradingRuleId();
-  }
+  clearPhase1TradingRuleCache();
+  const ruleId = await resolvePhase1TradingRuleId();
   if (!ruleId) {
     return {
       ok: false,
+      accountId,
       reason:
-        "Phase1 trading rule UUID not found — set DXFEED_DEFAULT_RULE_ID or sync TradingRule/List",
+        "No Evaluation Phase 1 rule found in Volumetrica TradingRule/List",
     };
   }
 
@@ -188,33 +239,16 @@ export async function ensureVolumetricaTradingRule(
     );
   } catch (err) {
     const reason = (err as Error).message;
-    // Stale cache / deleted rule — clear and retry once with fresh List.
-    if (/not found/i.test(reason)) {
-      clearPhase1TradingRuleCache();
-      const fresh = await resolvePhase1TradingRuleId();
-      if (fresh && fresh !== ruleId) {
-        try {
-          await propfirm.changeTradingRuleForAccount(accountId, fresh);
-          console.log(
-            `[dxfeed] ChangeTradingRuleForAccount retry ok order=${link.orderNumber} rule=${fresh}`,
-          );
-          void syncTradingRuleById(fresh).catch(() => {});
-          return { ok: true, ruleId: fresh };
-        } catch (e2) {
-          return { ok: false, ruleId: fresh, reason: (e2 as Error).message };
-        }
-      }
-    }
     console.warn(
       `[dxfeed] ChangeTradingRuleForAccount failed order=${link.orderNumber}:`,
       reason.slice(0, 240),
     );
-    return { ok: false, ruleId, reason };
+    return { ok: false, ruleId, accountId, reason };
   }
 
   void syncTradingRuleById(ruleId).catch((e) => {
     console.warn("[dxfeed] sync after ChangeTradingRuleForAccount:", (e as Error).message.slice(0, 160));
   });
 
-  return { ok: true, ruleId };
+  return { ok: true, ruleId, accountId };
 }

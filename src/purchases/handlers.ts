@@ -647,23 +647,34 @@ export async function handleOnboardingComplete(
     }
   }
 
-  // Complete onboarding → attach 50K Evaluation (Phase 1) on Volumetrica account.
+  // Complete onboarding → attach Evaluation Phase 1 on Volumetrica from TradingRule/List.
+  // Sign / Prepare agreement workflow is unchanged.
+  let ruleOk = false;
+  let ruleReason: string | undefined;
   if (dxfeedProvisionReady) {
     try {
       const { ensureVolumetricaTradingRule } = await import("../dxfeed/ensure-trading-rule.js");
       const link = await getDxFeedLinkByOrder(orderNumber);
-      if (link?.dxAccountId) {
+      if (link?.dxAccountId || link?.dxUserId) {
         const attached = await ensureVolumetricaTradingRule(link);
+        ruleOk = attached.ok;
+        ruleReason = attached.reason;
         if (!attached.ok) {
           console.warn(
-            `[onboarding] Volumetrica trading rule not attached for ${orderNumber}: ${attached.reason ?? "unknown"}`,
+            `[onboarding] Volumetrica Phase1 rule not attached for ${orderNumber}: ${attached.reason ?? "unknown"}`,
+          );
+        } else {
+          console.log(
+            `[onboarding] Volumetrica Phase1 rule attached for ${orderNumber} rule=${attached.ruleId}`,
           );
         }
       } else {
-        console.warn(`[onboarding] no dxAccountId for ${orderNumber} — cannot attach trading rule`);
+        ruleReason = "no dxFeed account linked to this order";
+        console.warn(`[onboarding] ${ruleReason} — cannot attach trading rule`);
       }
     } catch (e) {
-      console.error("[onboarding] ensure Volumetrica trading rule failed:", (e as Error).message);
+      ruleReason = (e as Error).message;
+      console.error("[onboarding] ensure Volumetrica trading rule failed:", ruleReason);
     }
   }
 
@@ -701,7 +712,9 @@ export async function handleOnboardingComplete(
     ok: true,
     orderNumber: redeemed.orderNumber,
     email: redeemed.email,
+    ruleOk,
     makeOk,
+    ...(ruleReason && !ruleOk ? { ruleReason } : {}),
     ...(makeReason && !makeOk ? { makeReason } : {}),
   });
 }
