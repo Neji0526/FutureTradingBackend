@@ -1,9 +1,10 @@
 import { config } from "../config.js";
-import type {
-  NewUserInput, UserResult,
-  NewTradingAccountInput, NewTradingAccountResult,
-  NewSubscriptionInput, SubscriptionResult,
-  SubscriptionView,
+import {
+  IdReference,
+  type NewUserInput, type UserResult,
+  type NewTradingAccountInput, type NewTradingAccountResult,
+  type NewSubscriptionInput, type SubscriptionResult,
+  type SubscriptionView,
 } from "./types.js";
 
 /** Volumetrica Propfirm REST client — authenticated with DXFEED_API_KEY (x-api-key). */
@@ -153,14 +154,19 @@ export class PropfirmClient {
   }
 
   /**
-   * Associate an org trading rule with an existing account.
-   * GET /api/Propsite/ChangeTradingRuleForAccount?accountId=&ruleId=
+   * Associate an org trading rule with an existing account (fills Admin "Account rule id").
+   * V2 POST /api/v2/Propsite/TradingAccount/ChangeTradingRule
+   * Requires accountRuleReference=Application (0) — V1 ChangeTradingRuleForAccount returns "Rule not found".
    * @see https://dxfeed.volumetricaprop.com/swagger/index.html
    */
   async changeTradingRuleForAccount(accountId: string, ruleId: string): Promise<void> {
-    await this.call<unknown>("ChangeTradingRuleForAccount", {
-      method: "GET",
-      query: { accountId, ruleId },
+    await this.callV2<unknown>("TradingAccount/ChangeTradingRule", {
+      method: "POST",
+      body: {
+        accountId,
+        accountRuleReference: IdReference.APPLICATION,
+        ruleId,
+      },
     });
   }
 

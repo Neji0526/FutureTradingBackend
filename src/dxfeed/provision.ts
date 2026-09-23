@@ -151,6 +151,16 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     if (remote?.subscriptionId) {
       applyRemoteSubscription(link, remote);
       await upsertDxFeedLink(link);
+      // Still attach Account rule id if the trading account exists without one.
+      try {
+        const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
+        await ensureVolumetricaTradingRule(link);
+      } catch (err) {
+        console.warn(
+          `[dxfeed] rule attach on recover order=${input.orderNumber}:`,
+          (err as Error).message.slice(0, 200),
+        );
+      }
       if (!link.agreementSigned) {
         await ensureAgreementRedirect(link, input.orderNumber, redirectUrl);
       }
@@ -159,8 +169,8 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   }
 
   if (!link.dxAccountId) {
-    // Create account without trading rule here — rule is attached on Complete onboarding
-    // via ChangeTradingRuleForAccount (avoids Prepare-agreement failures from bad rule ids).
+    // Create account first (no accountRuleId on create — Volumetrica rejects currency+rule).
+    // Immediately after: List rules → ChangeTradingRuleForAccount (fills Admin Account rule id).
     if (!link.dxUserId) {
       throw new Error("provisionForOnboarding: missing dxUserId before CreateTradingAccount");
     }
@@ -205,18 +215,23 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
     link.dxAccountId = acct.accountId;
     await upsertDxFeedLink(link);
+  }
 
-    const syncId = acct.tradingRuleId?.trim();
-    if (syncId) {
-      const { syncTradingRuleById } = await import("./trading-rules-sync.js");
-      const synced = await syncTradingRuleById(syncId);
-      if (synced.applied) {
-        console.log(
-          `[dxfeed] provision synced RuleTemplate ${synced.templateId} from ruleId=${syncId}`,
+  // Registration: save dxUserId/dxAccountId, then set Account rule id from TradingRule/List.
+  if (link.dxAccountId) {
+    try {
+      const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
+      const attached = await ensureVolumetricaTradingRule(link);
+      if (!attached.ok) {
+        console.warn(
+          `[dxfeed] provision rule attach skipped order=${input.orderNumber}: ${attached.reason ?? "unknown"}`,
         );
-      } else {
-        console.warn(`[dxfeed] provision rule sync skipped: ${synced.reason ?? "unknown"}`);
       }
+    } catch (err) {
+      console.warn(
+        `[dxfeed] provision rule attach failed order=${input.orderNumber}:`,
+        (err as Error).message.slice(0, 200),
+      );
     }
   }
 
