@@ -180,15 +180,13 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
     }
     const acct = await propfirm.createTradingAccount({
       userId: link.dxUserId,
-      balance: p.balance,
-      currency: Currency.USD,
       enabled: true,
       mode: AccountMode.EVALUATION,
       description: `Vault ${input.orderNumber}`,
-      // Organization-level Admin / sheet templates (organizationReferenceId).
+      // With a trading rule, currency/balance come from the rule (Volumetrica 400 if set on account).
       ...(resolvedRuleId
         ? { accountRuleReference: IdReference.ORGANIZATION, accountRuleId: resolvedRuleId }
-        : {}),
+        : { balance: p.balance, currency: Currency.USD }),
     });
     if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
     link.dxAccountId = acct.accountId;
