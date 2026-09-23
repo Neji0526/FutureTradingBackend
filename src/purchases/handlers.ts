@@ -23,7 +23,6 @@ import {
 import {
   notifyMakePlatformCredentials,
 } from "../dxfeed/make-credentials.js";
-import { ensureVolumetricaTradingRule } from "../dxfeed/ensure-trading-rule.js";
 import { attachDxFeedUserId, getDxFeedLinkByOrder, getDxFeedLinksByEmail, upsertDxFeedLink } from "../dxfeed/store.js";
 import { handleDxFeedWebhook } from "../dxfeed/webhook.js";
 import { DxFeedApiError } from "../dxfeed/propfirm.js";
@@ -363,14 +362,8 @@ export async function handleDxFeedAgreementStatus(
     return;
   }
 
-  // After dxFeed agreement is signed → attach Phase 1 trading rule on Volumetrica.
-  // Make.com credentials email is ONLY sent on Complete onboarding (not here — avoids
-  // duplicate passwords when the trader re-signs / polls status repeatedly).
-  if (link.agreementSigned) {
-    void ensureVolumetricaTradingRule(link).catch((e) => {
-      console.error("[onboarding] ensure trading rule after agreement failed:", (e as Error).message);
-    });
-  }
+  // Trading rule is attached on Complete onboarding only (not on agreement sign).
+  // Make.com credentials email is also only sent on Complete.
 
   json(res, 200, {
     ok: true,
@@ -651,6 +644,26 @@ export async function handleOnboardingComplete(
       await createEvaluationAccount(userId);
     } catch (e) {
       console.error("[onboarding] account provisioning failed:", (e as Error).message);
+    }
+  }
+
+  // Complete onboarding → attach 50K Evaluation (Phase 1) on Volumetrica account.
+  if (dxfeedProvisionReady) {
+    try {
+      const { ensureVolumetricaTradingRule } = await import("../dxfeed/ensure-trading-rule.js");
+      const link = await getDxFeedLinkByOrder(orderNumber);
+      if (link?.dxAccountId) {
+        const attached = await ensureVolumetricaTradingRule(link);
+        if (!attached.ok) {
+          console.warn(
+            `[onboarding] Volumetrica trading rule not attached for ${orderNumber}: ${attached.reason ?? "unknown"}`,
+          );
+        }
+      } else {
+        console.warn(`[onboarding] no dxAccountId for ${orderNumber} — cannot attach trading rule`);
+      }
+    } catch (e) {
+      console.error("[onboarding] ensure Volumetrica trading rule failed:", (e as Error).message);
     }
   }
 
