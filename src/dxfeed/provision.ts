@@ -84,6 +84,9 @@ export function agreementRedirectUrl(orderNumber: string): string | undefined {
  * Provision Volumetrica identity via DXFEED_API_KEY so the trader can sign the
  * market-data agreement during onboarding. Keyed by orderNumber (user may not
  * exist yet). Safe to retry — resumes after each successful step.
+ *
+ * Always creates a trading account when missing (Users ≠ Accounts on Volumetrica).
+ * Early subscription-recovery paths must not skip CreateTradingAccount.
  */
 export async function provisionForOnboarding(input: OnboardingProvisionInput): Promise<DxFeedLink> {
   if (!dxfeedProvisionReady) {
@@ -95,6 +98,7 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   const existing = await getDxFeedLinkByOrder(input.orderNumber);
   if (existing?.dxSubscriptionId) {
     const refreshed = (await refreshAgreementStatus(input.orderNumber)) ?? existing;
+    await ensureTradingAccount(refreshed, input);
     if (!refreshed.agreementSigned) {
       await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
     }
@@ -105,6 +109,7 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   const recovered = await adoptExistingSubscriptionForOrder(input.orderNumber, email);
   if (recovered?.dxSubscriptionId) {
     const refreshed = (await refreshAgreementStatus(input.orderNumber)) ?? recovered;
+    await ensureTradingAccount(refreshed, input);
     if (!refreshed.agreementSigned) {
       await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
     }
@@ -146,94 +151,21 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
   });
 
   // Remote already has a sub (local id missing) — recover via GetSubscriptionStatus(userId).
+  // Still must CreateTradingAccount if this user has no NEX account yet.
   if (!link.dxSubscriptionId) {
     const remote = await fetchRemoteSubscription(link.dxUserId);
     if (remote?.subscriptionId) {
       applyRemoteSubscription(link, remote);
       await upsertDxFeedLink(link);
-      // Still attach Account rule id if the trading account exists without one.
-      try {
-        const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
-        await ensureVolumetricaTradingRule(link);
-      } catch (err) {
-        console.warn(
-          `[dxfeed] rule attach on recover order=${input.orderNumber}:`,
-          (err as Error).message.slice(0, 200),
-        );
-      }
+      await ensureTradingAccount(link, input);
       if (!link.agreementSigned) {
         await ensureAgreementRedirect(link, input.orderNumber, redirectUrl);
       }
-      return link;
+      return (await getDxFeedLinkByOrder(input.orderNumber)) ?? (link as DxFeedLink);
     }
   }
 
-  if (!link.dxAccountId) {
-    // Create account first (no accountRuleId on create — Volumetrica rejects currency+rule).
-    // Immediately after: List rules → ChangeTradingRuleForAccount (fills Admin Account rule id).
-    if (!link.dxUserId) {
-      throw new Error("provisionForOnboarding: missing dxUserId before CreateTradingAccount");
-    }
-    let acct;
-    try {
-      acct = await propfirm.createTradingAccount({
-        userId: link.dxUserId,
-        balance: p.balance,
-        currency: Currency.USD,
-        enabled: true,
-        mode: AccountMode.EVALUATION,
-        description: `Vault ${input.orderNumber}`,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // Remote user vanished — recreate via V2 User and retry once.
-      if (/user not found/i.test(msg)) {
-        console.warn(
-          `[dxfeed] CreateTradingAccount user not found (${link.dxUserId.slice(0, 36)}) — recreate V2 User and retry`,
-        );
-        link.dxUserId = "";
-        await ensureRemotePlatformUser(link, {
-          firstName,
-          lastName,
-          email,
-          country,
-          orderNumber: input.orderNumber,
-          forceRecreate: true,
-        });
-        acct = await propfirm.createTradingAccount({
-          userId: link.dxUserId,
-          balance: p.balance,
-          currency: Currency.USD,
-          enabled: true,
-          mode: AccountMode.EVALUATION,
-          description: `Vault ${input.orderNumber}`,
-        });
-      } else {
-        throw err;
-      }
-    }
-    if (!acct.accountId) throw new Error("provisionForOnboarding: CreateTradingAccount returned no accountId");
-    link.dxAccountId = acct.accountId;
-    await upsertDxFeedLink(link);
-  }
-
-  // Registration: save dxUserId/dxAccountId, then set Account rule id from TradingRule/List.
-  if (link.dxAccountId) {
-    try {
-      const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
-      const attached = await ensureVolumetricaTradingRule(link);
-      if (!attached.ok) {
-        console.warn(
-          `[dxfeed] provision rule attach skipped order=${input.orderNumber}: ${attached.reason ?? "unknown"}`,
-        );
-      }
-    } catch (err) {
-      console.warn(
-        `[dxfeed] provision rule attach failed order=${input.orderNumber}:`,
-        (err as Error).message.slice(0, 200),
-      );
-    }
-  }
+  await ensureTradingAccount(link, input);
 
   if (!link.dxSubscriptionId) {
     try {
@@ -250,11 +182,12 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
           } catch (e2) {
             console.warn("[dxfeed] ensureV2 after adopt:", (e2 as Error).message.slice(0, 200));
           }
+          await ensureTradingAccount(link, input);
           await upsertDxFeedLink(link);
           if (!link.agreementSigned) {
             await ensureAgreementRedirect(link, input.orderNumber, redirectUrl);
           }
-          return link;
+          return (await getDxFeedLinkByOrder(input.orderNumber)) ?? (link as DxFeedLink);
         }
         const again = await adoptExistingSubscriptionForOrder(input.orderNumber, email, link.dxUserId);
         if (again?.dxSubscriptionId) {
@@ -265,6 +198,7 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
           } catch (e2) {
             console.warn("[dxfeed] ensureV2 after recover:", (e2 as Error).message.slice(0, 200));
           }
+          await ensureTradingAccount(refreshed, input);
           if (!refreshed.agreementSigned) {
             await ensureAgreementRedirect(refreshed, input.orderNumber, redirectUrl);
           }
@@ -286,7 +220,162 @@ export async function provisionForOnboarding(input: OnboardingProvisionInput): P
 
   await enrichDownloadAndLogin(link);
   await upsertDxFeedLink(link);
-  return link;
+  return (await getDxFeedLinkByOrder(input.orderNumber)) ?? (link as DxFeedLink);
+}
+
+/**
+ * Ensure Volumetrica trading account exists for this dxFeed user.
+ * Recovers via GetUserAccounts when local dxAccountId is missing; otherwise CreateTradingAccount.
+ * Exported so Complete onboarding can backfill before rule attach + Make.com.
+ */
+export async function ensureTradingAccount(
+  link: DxFeedLinkInput,
+  input?: Pick<OnboardingProvisionInput, "orderNumber"> | OnboardingProvisionInput,
+): Promise<{ ok: boolean; accountId?: string; created?: boolean; reason?: string }> {
+  if (!dxfeedProvisionReady) {
+    return { ok: false, reason: "dxfeed not configured" };
+  }
+  if (!link.dxUserId?.trim()) {
+    return { ok: false, reason: "missing dxUserId" };
+  }
+
+  const orderNumber = input?.orderNumber ?? link.orderNumber;
+  const p = config.dxfeed.provisioning;
+
+  // Already have a local account id — verify it still exists under this user.
+  if (link.dxAccountId?.trim()) {
+    try {
+      const accounts = await propfirm.getUserAccounts(link.dxUserId);
+      const stillThere = accounts.some((a) => pickAccountId([a]) === link.dxAccountId);
+      if (stillThere) {
+        return { ok: true, accountId: link.dxAccountId, created: false };
+      }
+      const adopt = pickAccountId(accounts);
+      if (adopt) {
+        link.dxAccountId = adopt;
+        await upsertDxFeedLink(link);
+        console.log(`[dxfeed] adopted existing account ${adopt} for order=${orderNumber}`);
+        return { ok: true, accountId: adopt, created: false };
+      }
+      // Empty list but we have a saved id — keep it (GetUserAccounts can lag).
+      return { ok: true, accountId: link.dxAccountId, created: false };
+    } catch (err) {
+      console.warn(
+        `[dxfeed] GetUserAccounts verify order=${orderNumber}:`,
+        (err as Error).message.slice(0, 160),
+      );
+      return { ok: true, accountId: link.dxAccountId, created: false };
+    }
+  }
+
+  // No local account — try remote list first (user may already have a NEX account).
+  try {
+    const accounts = await propfirm.getUserAccounts(link.dxUserId);
+    const adopt = pickAccountId(accounts);
+    if (adopt) {
+      link.dxAccountId = adopt;
+      await upsertDxFeedLink(link);
+      console.log(`[dxfeed] linked existing account ${adopt} for order=${orderNumber}`);
+      return { ok: true, accountId: adopt, created: false };
+    }
+  } catch (err) {
+    console.warn(
+      `[dxfeed] GetUserAccounts before create order=${orderNumber}:`,
+      (err as Error).message.slice(0, 160),
+    );
+  }
+
+  let acct;
+  try {
+    acct = await propfirm.createTradingAccount({
+      userId: link.dxUserId,
+      balance: p.balance,
+      currency: Currency.USD,
+      enabled: true,
+      mode: AccountMode.EVALUATION,
+      description: `Vault ${orderNumber}`,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/user not found/i.test(msg) && input && "email" in input) {
+      console.warn(
+        `[dxfeed] CreateTradingAccount user not found (${link.dxUserId.slice(0, 36)}) — recreate V2 User and retry`,
+      );
+      link.dxUserId = "";
+      link.dxAccountId = null;
+      await ensureRemotePlatformUser(link, {
+        firstName: input.firstName.trim() || "Trader",
+        lastName: input.lastName.trim() || "Account",
+        email: input.email.trim().toLowerCase(),
+        country: (input.country.trim().toUpperCase() || p.country).slice(0, 2),
+        orderNumber: input.orderNumber,
+        forceRecreate: true,
+      });
+      acct = await propfirm.createTradingAccount({
+        userId: link.dxUserId,
+        balance: p.balance,
+        currency: Currency.USD,
+        enabled: true,
+        mode: AccountMode.EVALUATION,
+        description: `Vault ${orderNumber}`,
+      });
+    } else {
+      console.error(`[dxfeed] CreateTradingAccount failed order=${orderNumber}:`, msg.slice(0, 300));
+      return { ok: false, reason: msg };
+    }
+  }
+
+  const accountId =
+    acct.accountId?.trim()
+    || (typeof (acct as unknown as { id?: string }).id === "string"
+      ? (acct as unknown as { id: string }).id.trim()
+      : "");
+  if (!accountId) {
+    return { ok: false, reason: "CreateTradingAccount returned no accountId" };
+  }
+  link.dxAccountId = accountId;
+  await upsertDxFeedLink(link);
+  console.log(
+    `[dxfeed] CreateTradingAccount ok order=${orderNumber} account=${accountId} header=${acct.header ?? "?"}`,
+  );
+  return { ok: true, accountId, created: true };
+}
+
+function pickAccountId(
+  accounts: Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>,
+): string | null {
+  for (const a of accounts) {
+    const id = (typeof a.accountId === "string" && a.accountId.trim())
+      || (typeof a.id === "string" && a.id.trim())
+      || "";
+    if (id) return id;
+  }
+  return null;
+}
+
+/**
+ * Complete-onboarding: ensure trading account exists, attach Phase 1 rule, then caller sends Make.com.
+ */
+export async function ensureAccountAndRuleForComplete(
+  orderNumber: string,
+): Promise<{ ok: boolean; ruleId?: string; accountId?: string; reason?: string }> {
+  const link = await getDxFeedLinkByOrder(orderNumber);
+  if (!link?.dxUserId) {
+    return { ok: false, reason: "no dxFeed user linked to this order" };
+  }
+  const acct = await ensureTradingAccount(link, { orderNumber });
+  if (!acct.ok || !acct.accountId) {
+    return { ok: false, reason: acct.reason ?? "could not create trading account" };
+  }
+  const fresh = (await getDxFeedLinkByOrder(orderNumber)) ?? link;
+  const { ensureVolumetricaTradingRule } = await import("./ensure-trading-rule.js");
+  const attached = await ensureVolumetricaTradingRule(fresh);
+  return {
+    ok: attached.ok,
+    ruleId: attached.ruleId,
+    accountId: attached.accountId ?? acct.accountId,
+    reason: attached.reason,
+  };
 }
 
 /**

@@ -106,18 +106,26 @@ export class PropfirmClient {
    * Prefill country/name so agreement signing works.
    */
   async createUserV2(input: NewUserInput): Promise<UserResult> {
-    return this.callV2<UserResult>("User", { method: "POST", body: input });
+    const raw = await this.callV2<UserResult & { id?: string }>("User", { method: "POST", body: input });
+    if (raw && !raw.userId && typeof raw.id === "string") {
+      return { ...raw, userId: raw.id };
+    }
+    return raw;
   }
 
   /**
    * V2 PUT /api/v2/Propsite/User?userId= — update existing user (e.g. rotate password).
    */
   async updateUserV2(userId: string, input: NewUserInput): Promise<UserResult> {
-    return this.callV2<UserResult>("User", {
+    const raw = await this.callV2<UserResult & { id?: string }>("User", {
       method: "PUT",
       query: { userId },
       body: input,
     });
+    if (raw && !raw.userId && typeof raw.id === "string") {
+      return { ...raw, userId: raw.id };
+    }
+    return raw;
   }
 
   /** @deprecated Prefer createUserV2 / updateUserV2 (V2 Propsite/User). */
@@ -226,8 +234,8 @@ export class PropfirmClient {
     return normalizeSubscriptionView(raw);
   }
 
-  getUserAccounts(userId: string): Promise<Array<{ id?: string; header?: string; enabled?: boolean }>> {
-    return this.call<Array<{ id?: string; header?: string; enabled?: boolean }>>("GetUserAccounts", {
+  getUserAccounts(userId: string): Promise<Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>> {
+    return this.call<Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>>("GetUserAccounts", {
       query: { userId },
     });
   }
