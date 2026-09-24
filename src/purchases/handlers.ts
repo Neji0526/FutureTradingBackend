@@ -19,6 +19,7 @@ import {
   refreshAgreementStatus,
   resetForOnboarding,
   resolvePlatformAccessForTrader,
+  ensureAccountAndRuleForComplete,
 } from "../dxfeed/provision.js";
 import {
   notifyMakePlatformCredentials,
@@ -647,34 +648,26 @@ export async function handleOnboardingComplete(
     }
   }
 
-  // Complete onboarding → attach Evaluation Phase 1 on Volumetrica from TradingRule/List.
-  // Sign / Prepare agreement workflow is unchanged.
+  // Complete onboarding → ensure trading account exists, attach Phase 1 rule, then Make.com.
   let ruleOk = false;
   let ruleReason: string | undefined;
   if (dxfeedProvisionReady) {
     try {
-      const { ensureVolumetricaTradingRule } = await import("../dxfeed/ensure-trading-rule.js");
-      const link = await getDxFeedLinkByOrder(orderNumber);
-      if (link?.dxAccountId || link?.dxUserId) {
-        const attached = await ensureVolumetricaTradingRule(link);
-        ruleOk = attached.ok;
-        ruleReason = attached.reason;
-        if (!attached.ok) {
-          console.warn(
-            `[onboarding] Volumetrica Phase1 rule not attached for ${orderNumber}: ${attached.reason ?? "unknown"}`,
-          );
-        } else {
-          console.log(
-            `[onboarding] Volumetrica Phase1 rule attached for ${orderNumber} rule=${attached.ruleId}`,
-          );
-        }
+      const attached = await ensureAccountAndRuleForComplete(orderNumber);
+      ruleOk = attached.ok;
+      ruleReason = attached.reason;
+      if (!attached.ok) {
+        console.warn(
+          `[onboarding] Volumetrica Phase1 rule not attached for ${orderNumber}: ${attached.reason ?? "unknown"}`,
+        );
       } else {
-        ruleReason = "no dxFeed account linked to this order";
-        console.warn(`[onboarding] ${ruleReason} — cannot attach trading rule`);
+        console.log(
+          `[onboarding] Volumetrica Phase1 rule attached for ${orderNumber} account=${attached.accountId} rule=${attached.ruleId}`,
+        );
       }
     } catch (e) {
       ruleReason = (e as Error).message;
-      console.error("[onboarding] ensure Volumetrica trading rule failed:", ruleReason);
+      console.error("[onboarding] ensure account+rule failed:", ruleReason);
     }
   }
 
