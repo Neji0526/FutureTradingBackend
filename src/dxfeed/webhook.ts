@@ -82,6 +82,16 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
           console.log(`[dxfeed] account ${accountId} DISABLED — ${ev.tradingAccount?.reason ?? "?"}`);
         }
       }
+      // Admin changed Account rule id in Volumetrica → mirror to Vault tier (soft).
+      try {
+        const { mirrorVaultTierFromDxAccount } = await import("./mirror-account-rule.js");
+        await mirrorVaultTierFromDxAccount(accountId);
+      } catch (err) {
+        console.warn(
+          `[dxfeed webhook] mirror account rule ${accountId}:`,
+          (err as Error).message.slice(0, 160),
+        );
+      }
       return;
     }
     case NotificationCategory.SUBSCRIPTIONS: {

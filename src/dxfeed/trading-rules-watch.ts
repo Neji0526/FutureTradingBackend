@@ -104,6 +104,19 @@ async function pollOnce(reason: string): Promise<void> {
       }
     }
 
+    // Reverse sync: Volumetrica Account rule id → Vault Account.ruleTemplateId (admin changes).
+    try {
+      const { mirrorAllLinkedAccountRules } = await import("./mirror-account-rule.js");
+      const mirrored = await mirrorAllLinkedAccountRules();
+      if (mirrored.updated > 0) {
+        console.log(
+          `[dxfeed rules] REST watch — mirrored ${mirrored.updated}/${mirrored.checked} account rule assignment(s)`,
+        );
+      }
+    } catch (err) {
+      console.warn("[dxfeed rules] mirror account rules:", (err as Error).message.slice(0, 160));
+    }
+
     if (changed) lastFingerprint = fp;
   } catch (err) {
     console.warn(`[dxfeed rules] REST watch (${reason}) error:`, (err as Error).message);
