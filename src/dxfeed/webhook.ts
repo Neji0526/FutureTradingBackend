@@ -71,8 +71,17 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
       const accountId = ev.accountId ?? ev.tradingAccount?.id ?? null;
       if (!accountId) return;
       const link = await getLinkByAccountId(accountId);
-      if (!link) return;
       const status = ev.tradingAccount?.status;
+      if (!link) {
+        if (status === AccountStatus.CHALLENGE_FAILED && ev.userId) {
+          const { deactivateSubscriptionOnFail } = await import("./challenge-subscription.js");
+          await deactivateSubscriptionOnFail(
+            { dxAccountId: accountId, dxUserId: ev.userId },
+            ev.tradingAccount?.reason ?? "challenge failed",
+          );
+        }
+        return;
+      }
       if (status != null && status !== link.accountStatus) {
         link.accountStatus = status;
         await upsertDxFeedLink(link);

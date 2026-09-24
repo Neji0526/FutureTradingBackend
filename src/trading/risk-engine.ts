@@ -1,6 +1,7 @@
 import { getPool } from "../db/pool.js";
 import type { OrderEngine } from "./order-engine.js";
 import type { AccountStream } from "../realtime/account-stream.js";
+import { deactivateSubscriptionForVaultAccount } from "../dxfeed/challenge-subscription.js";
 
 /* ------------------------------------------------------------------ *
  * Risk / evaluation engine — enforces the prop-firm Rule limits.
@@ -150,6 +151,11 @@ export class RiskEngine {
     }
   }
 
+  /** Fail an ACTIVE account from an external source (Volumetrica ChallengeFailed). */
+  async failExternally(accountId: string, violation: ViolationType, detail: string): Promise<void> {
+    await this.terminate(accountId, "FAILED", violation, detail);
+  }
+
   /** Daily loss hit: liquidate, pause trading today, record violation — account stays ACTIVE. */
   private async applyDailyLimitPause(accountId: string, loss: number, limit: number): Promise<void> {
     if (this.pauseProcessing.has(accountId)) return;
@@ -266,6 +272,10 @@ export class RiskEngine {
       console[outcome === "PASSED" ? "log" : "warn"](`[risk] account ${accountId} ${outcome} — ${detail}`);
       await this.accountStream.refreshAccount(accountId); // reload status/positions → pushed live
       this.accountStream.publishAdminUpdate({ kind: outcome, accountId, detail }); // notify admin dashboards
+      if (outcome === "FAILED") {
+        void deactivateSubscriptionForVaultAccount(accountId, detail).catch((e) =>
+          console.warn("[risk] deactivate dxFeed subscription failed:", (e as Error).message.slice(0, 160)));
+      }
     } catch (err) {
       console.error("[risk] terminate failed:", (err as Error).message);
     } finally {

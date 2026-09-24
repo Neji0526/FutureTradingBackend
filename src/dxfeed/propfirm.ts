@@ -234,6 +234,22 @@ export class PropfirmClient {
     return normalizeSubscriptionView(raw);
   }
 
+  /** V2 POST /api/v2/Propsite/Subscription/Deactive — end a subscription (e.g. challenge fail). */
+  async deactivateSubscriptionV2(subscriptionId: string): Promise<void> {
+    await this.callV2<unknown>("Subscription/Deactive", {
+      method: "POST",
+      body: { subscriptionId },
+    });
+  }
+
+  /** V2 POST /api/v2/Propsite/TradingAccount/Reset — back to start balance with the given status. */
+  async resetTradingAccountV2(accountId: string, status: number): Promise<void> {
+    await this.callV2<unknown>("TradingAccount/Reset", {
+      method: "POST",
+      body: { accountId, status },
+    });
+  }
+
   getUserAccounts(userId: string): Promise<Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>> {
     return this.call<Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>>("GetUserAccounts", {
       query: { userId },
@@ -291,8 +307,10 @@ export class PropfirmClient {
     return this.call<string[]>("GetEnabledAccountsId");
   }
 
-  getAccountInfo(accountId: string): Promise<{ tradingRuleId?: string | null }> {
-    return this.call<{ tradingRuleId?: string | null }>("GetAccountInfo", {
+  getAccountInfo(
+    accountId: string,
+  ): Promise<{ tradingRuleId?: string | null; status?: number | null; reason?: string | null }> {
+    return this.call<{ tradingRuleId?: string | null; status?: number | null; reason?: string | null }>("GetAccountInfo", {
       query: { accountId },
     });
   }

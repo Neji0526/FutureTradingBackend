@@ -20,6 +20,7 @@ import { startResetSweeper } from "./trading/reset-sweeper.js";
 import { startMarkPublisher, stopMarkPublisher } from "./realtime/mark-publisher.js";
 import { startMarketLiveConsole } from "./market-data/live-console.js";
 import { startTradingRulesWatch } from "./dxfeed/trading-rules-watch.js";
+import { setChallengeFailHandler } from "./dxfeed/mirror-account-status.js";
 
 
 function buildProvider(): MarketDataProvider {
@@ -122,6 +123,9 @@ orderEngine.start();
 // Driven by the AccountStream tick on live equity; liquidates + fails or passes.
 const riskEngine = new RiskEngine(orderEngine, accountStream);
 accountStream.setRiskEngine(riskEngine);
+setChallengeFailHandler((accountId, violation, detail) =>
+  riskEngine.failExternally(accountId, violation, detail),
+);
 
 // Auto-reset sweeper: resets FAILED accounts 12h after the trader requests it (self-service).
 if (useDatabase) startResetSweeper(accountStream);
