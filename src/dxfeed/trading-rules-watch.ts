@@ -117,6 +117,15 @@ async function pollOnce(reason: string): Promise<void> {
       console.warn("[dxfeed rules] mirror account rules:", (err as Error).message.slice(0, 160));
     }
 
+    // Trading account Disabled / ChallengeFailed → subscription Disabled.
+    try {
+      const { deactivateSubscriptionsForBlockedAccounts } = await import("./challenge-subscription.js");
+      const n = await deactivateSubscriptionsForBlockedAccounts();
+      if (n > 0) console.log(`[dxfeed rules] REST watch — deactivated ${n} subscription(s) for blocked account(s)`);
+    } catch (err) {
+      console.warn("[dxfeed rules] blocked account subscriptions:", (err as Error).message.slice(0, 160));
+    }
+
     if (changed) lastFingerprint = fp;
   } catch (err) {
     console.warn(`[dxfeed rules] REST watch (${reason}) error:`, (err as Error).message);

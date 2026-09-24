@@ -1,5 +1,6 @@
 /**
- * Challenge fail → deactivate the user's Volumetrica subscription (Status: Active → Disabled).
+ * Trading account ChallengeFailed or Disabled → deactivate the user's Volumetrica
+ * subscription (Status: Active → Disabled).
  * Vault reset → reset the Volumetrica trading account and re-activate the subscription,
  * otherwise the next poll would see ChallengeFailed again and re-fail the account.
  * Every step checks the remote state first, so webhook + poll + RiskEngine can all call it.
@@ -67,7 +68,7 @@ export async function deactivateSubscriptionOnFail(
   try {
     const sub = await resolveSubscription(dxUserId, link?.dxSubscriptionId ?? null);
     if (!sub) {
-      console.warn(`[dxfeed] challenge failed but no subscription found (dxUser=${dxUserId ?? "?"})`);
+      console.warn(`[dxfeed] trading account blocked but no subscription found (dxUser=${dxUserId ?? "?"})`);
       return false;
     }
     if (sub.status === SUBSCRIPTION_DISABLED) {
@@ -83,13 +84,51 @@ export async function deactivateSubscriptionOnFail(
     }
     await saveSubscriptionStatus(link, sub.id, SUBSCRIPTION_DISABLED);
     console.warn(
-      `[dxfeed] challenge failed → subscription ${sub.id.slice(0, 8)}… deactivated ` +
+      `[dxfeed] trading account blocked → subscription ${sub.id.slice(0, 8)}… deactivated ` +
         `(dxUser=${dxUserId ?? "?"}) — ${reason}`,
     );
     return true;
   } finally {
     inFlight.delete(key);
   }
+}
+
+export function isBlockedAccountStatus(status: number | null | undefined): boolean {
+  return status === AccountStatus.CHALLENGE_FAILED || status === AccountStatus.DISABLED;
+}
+
+/** accountId → status already handled, so a blocked account is checked once per status change. */
+const sweptStatus = new Map<string, number>();
+
+/**
+ * Poll: every Volumetrica trading account that is Disabled or ChallengeFailed
+ * (including accounts with no DxFeedAccount row) → deactivate the owner's subscription.
+ */
+export async function deactivateSubscriptionsForBlockedAccounts(): Promise<number> {
+  if (!dxfeedProvisionReady) return 0;
+  let deactivated = 0;
+  for (const status of [AccountStatus.DISABLED, AccountStatus.CHALLENGE_FAILED]) {
+    const accounts = await propfirm.listTradingAccountsByStatus(status);
+    for (const a of accounts) {
+      const accountId = a.accountId;
+      if (!accountId || sweptStatus.get(accountId) === status) continue;
+      const label = status === AccountStatus.DISABLED ? "trading account disabled" : "challenge failed";
+      try {
+        const done = await deactivateSubscriptionOnFail(
+          { dxAccountId: accountId, dxUserId: a.ownerUser?.userId ?? null },
+          `${a.header ?? accountId.slice(0, 8)} ${label}`,
+        );
+        if (done) deactivated += 1;
+        sweptStatus.set(accountId, status);
+      } catch (err) {
+        console.warn(
+          `[dxfeed] deactivate subscription for ${a.header ?? accountId.slice(0, 8)}:`,
+          (err as Error).message.slice(0, 160),
+        );
+      }
+    }
+  }
+  return deactivated;
 }
 
 /** Vault RiskEngine failed the account → deactivate the linked Volumetrica subscription. */

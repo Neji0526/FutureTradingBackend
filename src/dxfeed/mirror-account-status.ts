@@ -7,7 +7,7 @@
 import { useDatabase } from "../config.js";
 import { getPool } from "../db/pool.js";
 import { AccountStatus } from "./types.js";
-import { deactivateSubscriptionOnFail } from "./challenge-subscription.js";
+import { deactivateSubscriptionOnFail, isBlockedAccountStatus } from "./challenge-subscription.js";
 
 export type ExternalViolation = "DAILY_LOSS_EXCEEDED" | "MAX_DRAWDOWN_BREACHED";
 type ChallengeFailHandler = (
@@ -27,16 +27,18 @@ function violationForReason(reason: string): ExternalViolation {
 }
 
 /**
- * If Volumetrica reports ChallengeFailed for this trading account, fail the linked
- * Vault account (only while it is still ACTIVE — idempotent across webhook + poll).
+ * If Volumetrica reports ChallengeFailed or Disabled for this trading account, deactivate
+ * the subscription. On ChallengeFailed also fail the linked Vault account
+ * (only while it is still ACTIVE — idempotent across webhook + poll).
  */
 export async function mirrorVaultStatusFromDxAccount(
   dxAccountId: string,
   info: { status?: number | null; reason?: string | null },
 ): Promise<{ failed: boolean; reason?: string }> {
-  if (info.status !== AccountStatus.CHALLENGE_FAILED) return { failed: false };
+  if (!isBlockedAccountStatus(info.status)) return { failed: false };
 
-  const platformReason = info.reason?.trim() || "a risk rule was breached";
+  const platformReason = info.reason?.trim()
+    || (info.status === AccountStatus.DISABLED ? "trading account disabled" : "a risk rule was breached");
   try {
     await deactivateSubscriptionOnFail({ dxAccountId }, platformReason);
   } catch (err) {
@@ -46,6 +48,7 @@ export async function mirrorVaultStatusFromDxAccount(
     );
   }
 
+  if (info.status !== AccountStatus.CHALLENGE_FAILED) return { failed: false };
   if (!useDatabase) return { failed: false, reason: "no database" };
   const { rows } = await getPool().query<{ vaultAccountId: string; status: string }>(
     `SELECT a."id" AS "vaultAccountId", a."status"
