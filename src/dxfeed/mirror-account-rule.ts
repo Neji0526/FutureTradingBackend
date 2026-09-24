@@ -6,6 +6,7 @@
 import { useDatabase } from "../config.js";
 import { getPool } from "../db/pool.js";
 import { propfirm } from "./propfirm.js";
+import { mirrorVaultStatusFromDxAccount } from "./mirror-account-status.js";
 
 function challengePhaseForTemplatePhase(phase: string | null | undefined): number {
   return phase === "Challenge Phase 1" ? 1 : 2;
@@ -116,8 +117,16 @@ export async function mirrorVaultTierFromDxAccount(
   let tradingRuleId: string | null = null;
   try {
     const info = await propfirm.getAccountInfo(accountId);
-    const raw = (info as { tradingRuleId?: string | null })?.tradingRuleId;
+    const raw = info?.tradingRuleId;
     tradingRuleId = typeof raw === "string" && raw.trim() ? raw.trim() : null;
+    try {
+      await mirrorVaultStatusFromDxAccount(accountId, info ?? {});
+    } catch (err) {
+      console.warn(
+        `[dxfeed] mirror account status ${accountId.slice(0, 8)}:`,
+        (err as Error).message.slice(0, 160),
+      );
+    }
   } catch (err) {
     return { ok: false, reason: `GetAccountInfo: ${(err as Error).message.slice(0, 160)}` };
   }
@@ -162,14 +171,15 @@ export async function mirrorVaultTierFromDxAccount(
 }
 
 /**
- * Poll helper: mirror rule assignment for every DxFeedAccount that has userId + dxAccountId.
+ * Poll helper: mirror rule + status for every DxFeedAccount with a dxAccountId
+ * (rows without a Vault userId still get the challenge-fail subscription deactivation).
  * Called from the existing TradingRule REST watch (no new scheduler).
  */
 export async function mirrorAllLinkedAccountRules(): Promise<{ checked: number; updated: number }> {
   if (!useDatabase) return { checked: 0, updated: 0 };
   const { rows } = await getPool().query<{ dxAccountId: string }>(
     `SELECT DISTINCT "dxAccountId" FROM "DxFeedAccount"
-     WHERE "dxAccountId" IS NOT NULL AND "userId" IS NOT NULL`,
+     WHERE "dxAccountId" IS NOT NULL`,
   );
   let updated = 0;
   for (const row of rows) {

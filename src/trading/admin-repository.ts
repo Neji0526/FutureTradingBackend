@@ -2,6 +2,7 @@ import { getPool } from "../db/pool.js";
 import { getMultiplier } from "../instruments.js";
 import { LEGACY_TO_PRIME, nextTierFor } from "./tiers.js";
 import { bumpResetCount } from "./trader-stats.js";
+import { reactivateAfterVaultReset } from "../dxfeed/challenge-subscription.js";
 
 /* Admin/CRM reads + mutations over the real DB. Shapes mirror the frontend
    types (TradingApp/src/lib/types.ts). Fields the schema doesn't track
@@ -1098,6 +1099,8 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
     // Analytics: count this challenge reset (reset_count is a lifetime counter).
     await bumpResetCount(client, accountId);
     await client.query("COMMIT");
+    void reactivateAfterVaultReset(accountId).catch((e) =>
+      console.warn("[reset] dxFeed reactivate failed:", (e as Error).message.slice(0, 160)));
     return true;
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
