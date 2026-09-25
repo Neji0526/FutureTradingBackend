@@ -250,6 +250,17 @@ export class PropfirmClient {
     });
   }
 
+  /** V2 GET /api/v2/Propsite/TradingAccount/List?status= — all org accounts with that status. */
+  async listTradingAccountsByStatus(
+    status: number,
+  ): Promise<Array<{ accountId?: string; header?: string; status?: number; ownerUser?: { userId?: string } | null }>> {
+    const table = await this.callV2<{ data?: unknown } | unknown[]>("TradingAccount/List", {
+      query: { status, skip: 0, take: 1000 },
+    });
+    const rows = Array.isArray(table) ? table : (table as { data?: unknown })?.data;
+    return Array.isArray(rows) ? rows : [];
+  }
+
   getUserAccounts(userId: string): Promise<Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>> {
     return this.call<Array<{ id?: string; accountId?: string; header?: string; enabled?: boolean }>>("GetUserAccounts", {
       query: { userId },

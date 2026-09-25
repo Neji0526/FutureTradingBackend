@@ -73,11 +73,11 @@ async function dispatch(ev: WebhookEvent): Promise<void> {
       const link = await getLinkByAccountId(accountId);
       const status = ev.tradingAccount?.status;
       if (!link) {
-        if (status === AccountStatus.CHALLENGE_FAILED && ev.userId) {
-          const { deactivateSubscriptionOnFail } = await import("./challenge-subscription.js");
+        const { deactivateSubscriptionOnFail, isBlockedAccountStatus } = await import("./challenge-subscription.js");
+        if (isBlockedAccountStatus(status) && ev.userId) {
           await deactivateSubscriptionOnFail(
             { dxAccountId: accountId, dxUserId: ev.userId },
-            ev.tradingAccount?.reason ?? "challenge failed",
+            ev.tradingAccount?.reason ?? "trading account blocked",
           );
         }
         return;
