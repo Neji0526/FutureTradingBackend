@@ -61,6 +61,8 @@ export interface NewUserInput {
   systemAccess?: SystemAccess;
 }
 
+
+
 export interface NewTradingAccountInput {
   userId: string;
   /** Optional when a trading rule supplies starting balance. */
